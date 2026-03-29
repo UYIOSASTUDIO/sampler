@@ -30,8 +30,8 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<String, String> 
     let track_id = track.id;
     let mut all_samples = Vec::new();
 
-    // Limit auf 30 Sekunden (bei 44.1kHz), um RAM-Explosionen bei extrem langen Tracks zu verhindern
-    let max_samples = 44100 * 30;
+    // Limit auf 10 Minuten (44.1kHz Stereo) setzen, damit komplette Tracks decodiert werden
+    let max_samples = 44100 * 2 * 60 * 10;
 
     loop {
         let packet = match format.next_packet() {
@@ -63,7 +63,6 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<String, String> 
         return Err("No audio samples decoded".to_string());
     }
 
-    // Downsampling auf die gewünschte Anzahl an Balken (num_bars)
     let chunk_size = (all_samples.len() / num_bars).max(1);
     let mut waveform = Vec::with_capacity(num_bars);
 
@@ -80,7 +79,6 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<String, String> 
             }
         }
 
-        // Skaliere auf 0-100. Setze ein Minimum von 2, damit leise Stellen nicht als Lücke dargestellt werden.
         let mut val = (peak * 100.0).round() as u8;
         if val < 2 { val = 2; }
         if val > 100 { val = 100; }

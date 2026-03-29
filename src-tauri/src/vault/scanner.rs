@@ -117,31 +117,35 @@ async fn process_audio_file(path: PathBuf, pool: SqlitePool) -> Result<bool, Str
     };
 
     // 4. Insert into Database (aktualisiert mit instrument_type)
-    sqlx::query(
+    match sqlx::query(
         r#"
-        INSERT INTO samples (
+        INSERT OR IGNORE INTO samples (
             id, file_hash, original_path, filename, extension, file_size,
             duration_ms, sample_rate, channels, bit_depth, instrument_type, waveform_data
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#
     )
-        .bind(id)
-        .bind(file_hash)
-        .bind(original_path_str)
-        .bind(filename)
-        .bind(extension)
+        .bind(&id)
+        .bind(&file_hash)
+        .bind(&original_path_str)
+        .bind(&filename)
+        .bind(&extension)
         .bind(file_size)
         .bind(duration_ms)
         .bind(sample_rate)
         .bind(channels)
         .bind(bit_depth)
-        .bind(instrument_type)
-        .bind(waveform_json)
+        .bind(&instrument_type)
+        .bind(&waveform_json)
         .execute(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(true)
+        .await {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            // Enterprise Error Logging: Sichtbar im Terminal, falls etwas schiefgeht!
+            println!("CRITICAL DB ERROR for file {}: {}", filename, e);
+            Err(e.to_string())
+        }
+    }
 }
 
 async fn calculate_file_hash(path: &Path) -> std::io::Result<String> {
