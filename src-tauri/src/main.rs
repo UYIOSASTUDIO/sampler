@@ -12,7 +12,8 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init()) // Hier wird das Plugin initialisiert
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init()) // NEU: Aktiviert den direkten File-Stream
         .setup(|app_handle| {
             let app_dir = app_handle
                 .path()
@@ -41,10 +42,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::scan_library,
-            commands::get_samples,
-            commands::clear_database,
-            commands::read_audio_file
+            app::commands::scan_library,
+            app::commands::get_samples,
+            app::commands::clear_database
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");

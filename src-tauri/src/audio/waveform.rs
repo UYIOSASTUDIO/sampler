@@ -7,7 +7,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<String, String> {
+pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -85,5 +85,6 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<String, String> 
         waveform.push(val);
     }
 
-    serde_json::to_string(&waveform).map_err(|e| e.to_string())
+    // ÄNDERUNG 2: Wir geben die rohen Bytes direkt zurück, KEIN serde_json mehr!
+    Ok(waveform)
 }

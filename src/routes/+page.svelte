@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
+    import { convertFileSrc } from '@tauri-apps/api/core';
     import { open } from '@tauri-apps/plugin-dialog';
     import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight } from 'lucide-svelte';
 
@@ -12,13 +13,24 @@
         bpm: number | null;
         key_signature: string | null;
         instrument_type: string | null;
-        waveform_data: string | null;
+        waveform_data: number[] | null; // GEÄNDERT: number[] statt string
     };
 
     type PaginatedResponse = {
         samples: SampleRecord[];
         total_count: number;
     };
+
+    let searchQuery: string = $state('');
+    let searchTimeout: ReturnType<typeof setTimeout>;
+
+    function handleSearchInput() {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => {
+            currentPage = 1;
+            loadSamples();
+        }, 300); // 300ms Debounce
+    }
 
     let samples: SampleRecord[] = $state([]);
     let isLoading: boolean = $state(true);
@@ -51,53 +63,49 @@
         return pages;
     });
 
-    // --- BULLETPROOF AUDIO ENGINE & KEYBOARD NAV ---
-    let globalAudio: HTMLAudioElement;
+    // --- ZERO-LATENCY WEB AUDIO API & RAM CACHE ---
+    let audioCtx: AudioContext;
+    let sourceNode: AudioBufferSourceNode | null = null;
     let playingId: string | null = $state(null);
-    let selectedId: string | null = $state(null); // Speichert die aktive Zeile
-    let currentBlobUrl: string | null = null;
-    let playbackProgress: number = $state(0);
+    let selectedId: string | null = $state(null);
 
+    // Der "Redis" RAM Cache für den Browser
+    const audioRamCache = new Map<string, AudioBuffer>();
+
+    let playbackProgress: number = $state(0);
+    let currentSampleDuration: number = 0;
+    let playbackStartTime: number = 0;
     let animationFrameId: number;
-    let currentPlayRequest: number = 0; // Token-System für Race Conditions
 
     const filters = ["Instruments", "Genres", "Key", "BPM", "One-Shots & Loops"];
     const instrumentTypes = ["Kick", "Snare", "Clap", "HiHat", "Cymbal", "Percussion", "Bass", "Vocal", "FX", "Synth", "Loop"];
 
-    // 60fps Render-Loop für die Waveform-Balken
     function updateProgress() {
-        if (globalAudio && !globalAudio.paused && globalAudio.duration) {
-            playbackProgress = globalAudio.currentTime / globalAudio.duration;
-            animationFrameId = requestAnimationFrame(updateProgress);
+        if (playingId && currentSampleDuration > 0 && audioCtx) {
+            const elapsed = audioCtx.currentTime - playbackStartTime;
+            playbackProgress = elapsed / currentSampleDuration;
+
+            if (playbackProgress >= 1.0) {
+                playbackProgress = 1.0;
+                playingId = null;
+                cancelAnimationFrame(animationFrameId);
+            } else {
+                animationFrameId = requestAnimationFrame(updateProgress);
+            }
         }
     }
 
     onMount(async () => {
-        globalAudio = new window.Audio();
-        globalAudio.loop = false;
-
-        globalAudio.onplay = () => {
-            cancelAnimationFrame(animationFrameId);
-            animationFrameId = requestAnimationFrame(updateProgress);
-        };
-
-        globalAudio.onpause = () => {
-            cancelAnimationFrame(animationFrameId);
-        };
-
-        globalAudio.onended = () => {
-            playingId = null;
-            playbackProgress = 0;
-            cancelAnimationFrame(animationFrameId);
-        };
-
+        // @ts-ignore Safari Fallback
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new AudioContextClass();
         window.addEventListener('keydown', handleKeydown);
         await loadSamples();
     });
 
     onDestroy(() => {
-        if (globalAudio) globalAudio.pause();
-        if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
+        if (sourceNode) sourceNode.stop();
+        if (audioCtx) audioCtx.close();
         cancelAnimationFrame(animationFrameId);
         window.removeEventListener('keydown', handleKeydown);
     });
@@ -105,12 +113,22 @@
     async function loadSamples() {
         isLoading = true;
         try {
-            const response = await invoke<PaginatedResponse>('get_samples', { filterType: activeTypeFilter, page: currentPage, pageSize: pageSize });
+            const response = await invoke<PaginatedResponse>('get_samples', {
+                filterType: activeTypeFilter,
+                // Sendet null an Rust, wenn der String leer ist oder nur aus Leerzeichen besteht
+                searchQuery: searchQuery.trim() !== '' ? searchQuery.trim() : null,
+                page: currentPage,
+                pageSize: pageSize
+            });
             samples = response.samples;
             totalItems = response.total_count;
-            if (scrollContainer) scrollContainer.scrollTop = 0;
-            if (globalAudio && !globalAudio.paused) {
-                globalAudio.pause();
+
+            if (scrollContainer) {
+                scrollContainer.scrollTop = 0;
+            }
+
+            if (sourceNode) {
+                sourceNode.stop();
                 playingId = null;
             }
         } catch (error) {
@@ -120,9 +138,7 @@
         }
     }
 
-    // --- KEYBOARD LOGIC ---
     function handleKeydown(e: KeyboardEvent) {
-        // Ignoriere Tastatur, wenn der User in einem Textfeld tippt
         if (document.activeElement?.tagName === 'INPUT') return;
 
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -130,7 +146,6 @@
             if (samples.length === 0) return;
 
             let currentIndex = samples.findIndex(s => s.id === selectedId);
-
             if (e.key === 'ArrowDown') {
                 currentIndex = currentIndex === -1 ? 0 : Math.min(samples.length - 1, currentIndex + 1);
             } else {
@@ -139,64 +154,115 @@
 
             const nextSample = samples[currentIndex];
             handlePlayRequest(nextSample);
-        }
-    }
 
-    // --- AUDIO PLAY LOGIC ---
-    async function handlePlayRequest(sample: SampleRecord) {
-        const requestId = ++currentPlayRequest;
-        selectedId = sample.id;
-
-        if (playingId === sample.id) {
-            globalAudio.pause();
-            playingId = null;
-            return;
-        }
-
-        // UI direkt aktualisieren, bevor der asynchrone Prozess startet
-        playingId = sample.id;
-        playbackProgress = 0;
-        cancelAnimationFrame(animationFrameId);
-
-        globalAudio.pause();
-        if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
-
-        try {
-            const bytes = await invoke<number[]>('read_audio_file', { path: sample.original_path });
-
-            // Race Condition Abwehr: Verwerfen, falls ein neuer Request gestartet wurde
-            if (requestId !== currentPlayRequest) return;
-
-            const blob = new Blob([new Uint8Array(bytes)]);
-            currentBlobUrl = URL.createObjectURL(blob);
-            globalAudio.src = currentBlobUrl;
-            await globalAudio.play();
-        } catch (error) {
-            if (requestId === currentPlayRequest) {
-                console.error("Failed to play audio:", error);
-                playingId = null;
+            const element = document.getElementById(`sample-${nextSample.id}`);
+            if (element) {
+                element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             }
         }
     }
 
-    // ... Pagination & UI Helper (nextPage, prevPage, toggleFilter, parseWaveform, etc.) bleiben gleich ...
+    async function handlePlayRequest(sample: SampleRecord) {
+        selectedId = sample.id;
+
+        if (playingId === sample.id) {
+            if (sourceNode) sourceNode.stop();
+            playingId = null;
+            cancelAnimationFrame(animationFrameId);
+            return;
+        }
+
+        if (sourceNode) sourceNode.stop();
+        cancelAnimationFrame(animationFrameId);
+
+        playingId = sample.id;
+        playbackProgress = 0;
+
+        // RAM Cache Logik
+        let audioBuffer = audioRamCache.get(sample.id);
+
+        if (!audioBuffer) {
+            try {
+                const assetUrl = convertFileSrc(sample.original_path);
+                const response = await fetch(assetUrl);
+                const arrayBuffer = await response.arrayBuffer();
+                audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+                // Cache Management: Maximal 200 Dateien im RAM halten, um Speicherlecks zu verhindern
+                if (audioRamCache.size >= 200) {
+                    const firstKey = audioRamCache.keys().next().value;
+                    if (firstKey) audioRamCache.delete(firstKey);
+                }
+                audioRamCache.set(sample.id, audioBuffer);
+            } catch (error) {
+                console.error("Audio decoding failed:", error);
+                playingId = null;
+                return;
+            }
+        }
+
+        // Sicherstellen, dass der User in den Millisekunden des Ladens nicht weitergeklickt hat
+        if (playingId !== sample.id) return;
+
+        sourceNode = audioCtx.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+        sourceNode.connect(audioCtx.destination);
+
+        sourceNode.onended = () => {
+            if (playingId === sample.id) {
+                playingId = null;
+                playbackProgress = 0;
+                cancelAnimationFrame(animationFrameId);
+            }
+        };
+
+        currentSampleDuration = audioBuffer.duration;
+        playbackStartTime = audioCtx.currentTime;
+
+        sourceNode.start(0);
+        animationFrameId = requestAnimationFrame(updateProgress);
+    }
+
     function goToPage(p: number) { if (p !== currentPage) { currentPage = p; loadSamples(); } }
     function nextPage() { if (currentPage < totalPages) { currentPage++; loadSamples(); } }
     function prevPage() { if (currentPage > 1) { currentPage--; loadSamples(); } }
     function toggleFilter(type: string) { activeTypeFilter = activeTypeFilter === type ? null : type; currentPage = 1; loadSamples(); }
-    function parseWaveform(data: string | null): number[] { if (!data) return Array(40).fill(10); try { return JSON.parse(data); } catch { return Array(40).fill(10); } }
+
+    function parseWaveform(data: number[] | null): number[] {
+        if (!data || data.length === 0) return Array(40).fill(10);
+        return data;
+    }
 
     async function handleSelectFolder() { try { const result = await open({ directory: true, multiple: false }); if (result) { selectedPath = result as string; scanMessage = 'Ready to scan.'; } } catch (error) { console.error(error); } }
     async function handleScan() { if (!selectedPath) return; isScanning = true; scanMessage = 'Indexing...'; try { const count = await invoke<number>('scan_library', { path: selectedPath }); scanMessage = `Added ${count} files.`; selectedPath = null; currentPage = 1; await loadSamples(); } catch (error) { scanMessage = `Error: ${error}`; } finally { isScanning = false; } }
     async function handleClearDatabase() { if (confirm("Clear the entire library?")) { isScanning = true; try { await invoke('clear_database'); activeTypeFilter = null; currentPage = 1; samples = []; totalItems = 0; scanMessage = 'Library cleared.'; } catch (error) { scanMessage = `Error: ${error}`; } finally { isScanning = false; } } }
-    function formatDuration(ms: number): string { if (ms === 0) return "--:--"; const totalSec = Math.floor(ms / 1000); return `${Math.floor(totalSec / 60)}:${(totalSec % 60).toString().padStart(2, '0')}`; }
+
+    function formatDuration(ms: number): string {
+        if (ms === 0) return "--:--";
+        const totalSec = Math.floor(ms / 1000);
+        return `${Math.floor(totalSec / 60)}:${(totalSec % 60).toString().padStart(2, '0')}`;
+    }
 </script>
 
 <div class="flex flex-col h-full overflow-hidden">
     <div class="px-8 pt-8 shrink-0">
         <div class="mb-6 flex items-end justify-between border-b border-zinc-200 pb-0 dark:border-zinc-800">
-            <div>
-                <h1 class="text-3xl font-bold tracking-tight mb-4">Sounds</h1>
+
+            <div class="flex-1">
+                <div class="flex items-center gap-6 mb-4">
+                    <h1 class="text-3xl font-bold tracking-tight">Sounds</h1>
+
+                    <div class="relative max-w-md w-full ml-4">
+                        <input
+                                type="text"
+                                bind:value={searchQuery}
+                                oninput={handleSearchInput}
+                                placeholder="Search in 1,000,000+ samples..."
+                                class="w-full rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-900 focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-[#18181b] dark:text-zinc-100 dark:focus:border-zinc-100 dark:focus:ring-zinc-100"
+                        >
+                    </div>
+                </div>
+
                 <div class="flex gap-6">
                     <button class="border-b-2 border-zinc-900 pb-2 text-sm font-semibold text-zinc-900 dark:border-zinc-100 dark:text-zinc-100">Samples</button>
                     <button class="pb-2 text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400">Presets</button>
@@ -220,6 +286,7 @@
                     </button>
                 </div>
             </div>
+
         </div>
 
         <div class="mb-4 space-y-4">
@@ -261,7 +328,8 @@
             <div class="divide-y divide-zinc-100 dark:divide-zinc-800/50 mb-8">
                 {#each samples as sample}
                     <div
-                            class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 transition-colors rounded-md -mx-2 px-2
+                            id="sample-{sample.id}"
+                            class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 rounded-md -mx-2 px-2
                         {selectedId === sample.id ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/20'}"
                     >
 
@@ -285,7 +353,7 @@
                         <div class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity">
                             {#each parseWaveform(sample.waveform_data) as barHeight, i}
                                 <div
-                                        class="w-[3px] rounded-full transition-colors
+                                        class="w-[3px] rounded-full
                                     {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}"
                                         style="height: {barHeight}%;"
                                 ></div>
