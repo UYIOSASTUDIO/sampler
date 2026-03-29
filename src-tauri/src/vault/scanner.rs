@@ -6,6 +6,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 use crate::audio::analyzer;
 use crate::audio::classify;
+use crate::audio::waveform;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "aiff", "ogg"];
 
@@ -96,6 +97,12 @@ async fn process_audio_file(path: PathBuf, pool: SqlitePool) -> Result<bool, Str
     // Heuristische Klassifikation über den Dateinamen
     let instrument_type = classify::classify_by_filename(&filename);
 
+    let waveform_json = waveform::extract_waveform(&path, 40).unwrap_or_else(|_| {
+        // Fallback: Wenn Decodierung fehlschlägt, flache Linie speichern
+        let fallback_array = vec![10; 40];
+        serde_json::to_string(&fallback_array).unwrap()
+    });
+
     let (duration_ms, sample_rate, channels, bit_depth) = match analyzer::extract_metadata(&path) {
         Ok(meta) => (
             meta.duration_ms,
@@ -114,8 +121,8 @@ async fn process_audio_file(path: PathBuf, pool: SqlitePool) -> Result<bool, Str
         r#"
         INSERT INTO samples (
             id, file_hash, original_path, filename, extension, file_size,
-            duration_ms, sample_rate, channels, bit_depth, instrument_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            duration_ms, sample_rate, channels, bit_depth, instrument_type, waveform_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#
     )
         .bind(id)
@@ -129,6 +136,7 @@ async fn process_audio_file(path: PathBuf, pool: SqlitePool) -> Result<bool, Str
         .bind(channels)
         .bind(bit_depth)
         .bind(instrument_type)
+        .bind(waveform_json)
         .execute(&pool)
         .await
         .map_err(|e| e.to_string())?;

@@ -12,6 +12,7 @@
         bpm: number | null;
         key_signature: string | null;
         instrument_type: string | null;
+        waveform_data: string | null;
     };
 
     let samples: SampleRecord[] = $state([]);
@@ -22,8 +23,8 @@
     let scanMessage: string = $state('');
     let activeTypeFilter: string | null = $state(null);
 
-    // --- NEU: Audio State Management ---
-    let currentAudio: HTMLAudioElement | null = null;
+    // --- SINGLETON AUDIO ENGINE ---
+    let globalAudio: HTMLAudioElement;
     let playingId: string | null = $state(null);
     let currentBlobUrl: string | null = null;
 
@@ -34,13 +35,19 @@
     ];
 
     onMount(async () => {
+        // Erstelle exakt EIN Audio-Objekt für die gesamte App
+        globalAudio = new window.Audio();
+        globalAudio.loop = false; // Verhindert ungewolltes Loopen hart
+        globalAudio.onended = () => {
+            playingId = null;
+        };
+
         await loadSamples();
     });
 
-    // Speicherlecks beim Verlassen der Komponente verhindern
     onDestroy(() => {
-        if (currentAudio) {
-            currentAudio.pause();
+        if (globalAudio) {
+            globalAudio.pause();
         }
         if (currentBlobUrl) {
             URL.revokeObjectURL(currentBlobUrl);
@@ -59,48 +66,45 @@
     }
 
     function toggleFilter(type: string) {
-        if (activeTypeFilter === type) {
-            activeTypeFilter = null;
-        } else {
-            activeTypeFilter = type;
-        }
+        if (activeTypeFilter === type) activeTypeFilter = null;
+        else activeTypeFilter = type;
         loadSamples();
     }
 
-    // --- NEU: Audio Playback Engine ---
     async function togglePlay(sample: SampleRecord) {
-        // Wenn derselbe Sound läuft, pausiere ihn
-        if (playingId === sample.id && currentAudio) {
-            currentAudio.pause();
+        // Pausiere sofort, wenn wir auf denselben Sound klicken
+        if (playingId === sample.id) {
+            globalAudio.pause();
             playingId = null;
             return;
         }
 
-        // Wenn ein anderer Sound läuft, stoppe diesen und räume den RAM auf
-        if (currentAudio) {
-            currentAudio.pause();
-            if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
-        }
+        // Stoppe vorherigen Sound und räume Memory auf
+        globalAudio.pause();
+        if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
 
         try {
-            playingId = sample.id; // UI reagiert sofort
+            playingId = sample.id;
 
-            // Lade die Audio-Bytes aus dem Rust-Backend
             const bytes = await invoke<number[]>('read_audio_file', { path: sample.original_path });
-            const uint8Array = new Uint8Array(bytes);
-
-            // Konvertiere Bytes zu Blob und generiere eine interne URL
-            const blob = new Blob([uint8Array]);
+            const blob = new Blob([new Uint8Array(bytes)]);
             currentBlobUrl = URL.createObjectURL(blob);
 
-            currentAudio = new Audio(currentBlobUrl);
-            currentAudio.onended = () => {
-                playingId = null; // UI Play-Button zurücksetzen, wenn fertig
-            };
-            await currentAudio.play();
+            globalAudio.src = currentBlobUrl;
+            await globalAudio.play();
         } catch (error) {
             console.error("Failed to play audio:", error);
             playingId = null;
+        }
+    }
+
+    // JSON String (z.B. "[10, 50, 20]") aus DB parsen
+    function parseWaveform(data: string | null): number[] {
+        if (!data) return Array(40).fill(10);
+        try {
+            return JSON.parse(data);
+        } catch {
+            return Array(40).fill(10);
         }
     }
 
@@ -296,10 +300,10 @@
                     </div>
 
                     <div class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity">
-                        {#each generateWaveformBars(sample.id) as barHeight}
+                        {#each parseWaveform(sample.waveform_data) as barHeight}
                             <div
                                     class="w-[3px] rounded-full transition-colors duration-200 {playingId === sample.id ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}"
-                                    style="height: {barHeight}px;"
+                                    style="height: {barHeight}%;"
                             ></div>
                         {/each}
                     </div>

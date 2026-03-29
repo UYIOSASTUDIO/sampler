@@ -4,7 +4,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use tauri::State;
 
-// DTO für den Datentransfer zum Frontend
+// 1. Struct um waveform_data erweitern
 #[derive(Debug, Serialize, FromRow)]
 pub struct SampleRecord {
     pub id: String,
@@ -14,6 +14,7 @@ pub struct SampleRecord {
     pub bpm: Option<f64>,
     pub key_signature: Option<String>,
     pub instrument_type: Option<String>,
+    pub waveform_data: Option<String>, // Neu hinzugefügt
 }
 
 #[tauri::command]
@@ -25,7 +26,6 @@ pub async fn scan_library(
     scanner::scan_directory(path, pool).await
 }
 
-// Neuer Command zum Abrufen der Library
 #[tauri::command]
 pub async fn get_samples(
     filter_type: Option<String>,
@@ -34,9 +34,9 @@ pub async fn get_samples(
     let pool = &state.db;
 
     let samples = if let Some(t) = filter_type {
-        // Wenn ein Filter gesetzt ist, nutze die WHERE-Klausel
+        // 2. SELECT Query MIT Filter anpassen
         sqlx::query_as::<_, SampleRecord>(
-            "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type
+            "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type, waveform_data
              FROM samples
              WHERE instrument_type = ?
              ORDER BY imported_at DESC"
@@ -45,9 +45,9 @@ pub async fn get_samples(
             .fetch_all(pool)
             .await
     } else {
-        // Wenn kein Filter gesetzt ist (Option::None), lade alle
+        // 3. SELECT Query OHNE Filter anpassen
         sqlx::query_as::<_, SampleRecord>(
-            "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type
+            "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type, waveform_data
              FROM samples
              ORDER BY imported_at DESC"
         )
@@ -62,7 +62,6 @@ pub async fn get_samples(
 pub async fn clear_database(state: State<'_, AppState>) -> Result<(), String> {
     let pool = &state.db;
 
-    // Löscht alle Einträge aus der samples Tabelle
     sqlx::query("DELETE FROM samples")
         .execute(pool)
         .await
@@ -73,6 +72,5 @@ pub async fn clear_database(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
-    // Liest die Datei asynchron in einen Byte-Vektor
     tokio::fs::read(&path).await.map_err(|e| e.to_string())
 }

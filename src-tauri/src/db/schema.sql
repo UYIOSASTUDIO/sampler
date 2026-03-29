@@ -5,8 +5,8 @@ PRAGMA foreign_keys = ON;
 
 -- 1. Samples Table (Core Entity)
 CREATE TABLE IF NOT EXISTS samples (
-                                       id TEXT PRIMARY KEY NOT NULL, -- UUID
-                                       file_hash TEXT UNIQUE NOT NULL, -- SHA256 Hash
+                                       id TEXT PRIMARY KEY NOT NULL,
+                                       file_hash TEXT UNIQUE NOT NULL,
                                        original_path TEXT NOT NULL,
                                        vault_path TEXT,
                                        filename TEXT NOT NULL,
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS samples (
                                        sample_rate INTEGER NOT NULL,
                                        channels INTEGER NOT NULL,
                                        bit_depth INTEGER NOT NULL,
+                                       waveform_data TEXT, -- NEU: Speichert das [10, 40, 100, 20...] Array
                                        peak_db REAL,
                                        rms_db REAL,
                                        lufs_db REAL,
