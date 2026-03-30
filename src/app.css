@@ -188,3 +188,18 @@
 		display: none;
 	}
 }
+
+/* Verhindert das "Rubber-Banding" / Zurückschnappen des Mac-Webviews */
+html, body {
+	overscroll-behavior: none;
+	overflow: hidden; /* Die App ist 100vh groß, nur innere Container dürfen scrollen */
+	/* Verhindert Text-Auswahl beim schnellen Klicken, was sich ebenfalls nach Webseite anfühlt */
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+/* Erlaubt die Textauswahl nur in Eingabefeldern (Search Bar, Renamer) */
+input, textarea {
+	user-select: auto;
+	-webkit-user-select: auto;
+}

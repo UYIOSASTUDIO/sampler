@@ -34,3 +34,6 @@ tauri-plugin-fs = "2.4.5"
 futures = "0.3.32"
 walkdir = "2.5.0"
 notify-debouncer-mini = "0.7.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.4"

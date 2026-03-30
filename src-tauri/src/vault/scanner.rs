@@ -6,9 +6,19 @@ use std::io::Read;
 use uuid::Uuid;
 use futures::stream::{self, StreamExt};
 use walkdir::WalkDir;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter}; // Für das Event-Streaming
 use crate::audio::{analyzer, classify, waveform};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["wav", "mp3", "aiff", "flac", "ogg", "m4a"];
+
+// Das Enterprise Progress-Payload für Svelte
+#[derive(Clone, Serialize)]
+pub struct ScanProgressPayload {
+    pub total: usize,
+    pub current: usize,
+    pub current_file: String,
+}
 
 pub fn is_supported_audio_file(path: &Path) -> bool {
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
@@ -22,7 +32,6 @@ pub fn is_supported_audio_file(path: &Path) -> bool {
     false
 }
 
-// Transfer-Objekt für den Thread-Pool
 struct CpuAnalysisResult {
     original_path: String,
     filename: String,
@@ -34,7 +43,7 @@ struct CpuAnalysisResult {
     channels: i64,
     bit_depth: i64,
     instrument_type: Option<String>,
-    waveform_data: Vec<u8>, // GEÄNDERT: Vec<u8> statt String
+    waveform_data: Vec<u8>,
 }
 
 fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
@@ -68,11 +77,14 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
     Ok(CpuAnalysisResult {
         original_path, filename, extension, file_hash, file_size,
         duration_ms, sample_rate, channels, bit_depth, instrument_type,
-        waveform_data // GEÄNDERT: Feldname anpassen
+        waveform_data
     })
 }
 
-pub async fn scan_directory(path: String, pool: SqlitePool) -> Result<usize, String> {
+// Signatur um AppHandle erweitert
+pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> Result<usize, String> {
+    tracing::info!("Starting directory scan for: {}", path);
+
     let files = tokio::task::spawn_blocking(move || {
         let mut valid_files = Vec::new();
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
@@ -86,27 +98,41 @@ pub async fn scan_directory(path: String, pool: SqlitePool) -> Result<usize, Str
         valid_files
     }).await.map_err(|e| format!("Directory read error: {}", e))?;
 
-    if files.is_empty() { return Ok(0); }
+    let total_files = files.len();
+    if total_files == 0 {
+        tracing::info!("No valid audio files found in directory.");
+        return Ok(0);
+    }
+
+    tracing::info!("Found {} valid audio files. Beginning CPU analysis...", total_files);
 
     let concurrency_limit = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2;
     let mut processed_count = 0;
+    let mut scanned_so_far = 0; // Neu: Zählt die verarbeiteten Dateien für die UI
 
-    // Stream der die CPU-Berechnungen durchführt
+    // Initiales Event feuern (0%)
+    let _ = app.emit("scan-progress", ScanProgressPayload {
+        total: total_files,
+        current: 0,
+        current_file: String::from("Warming up threads..."),
+    });
+
     let stream = stream::iter(files).map(|file_path| {
         tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&file_path))
     }).buffer_unordered(concurrency_limit);
 
-    // Chunks: Wir sammeln 500 analysierte Dateien im RAM
     let mut chunk_stream = stream.chunks(500);
 
-    // Batch-Insert Phase
     while let Some(chunk) = chunk_stream.next().await {
-        // Starte eine einzige, massive Transaktion für alle 500 Dateien
+        let chunk_len = chunk.len();
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let mut last_filename = String::new();
 
         for task_res in chunk {
             if let Ok(Ok(analysis)) = task_res {
                 let id = Uuid::new_v4().to_string();
+                last_filename = analysis.filename.clone(); // Merken für die UI
+
                 let insert_result = sqlx::query(
                     r#"
                     INSERT OR IGNORE INTO samples (
@@ -126,36 +152,41 @@ pub async fn scan_directory(path: String, pool: SqlitePool) -> Result<usize, Str
                     .bind(analysis.channels)
                     .bind(analysis.bit_depth)
                     .bind(&analysis.instrument_type)
-                    .bind(&analysis.waveform_data) // GEÄNDERT
+                    .bind(&analysis.waveform_data)
                     .execute(&mut *tx)
                     .await;
 
-                if let Ok(res) = insert_result {
-                    if res.rows_affected() > 0 {
-                        processed_count += 1;
-                    }
+                match insert_result {
+                    Ok(res) => { if res.rows_affected() > 0 { processed_count += 1; } }
+                    Err(e) => { tracing::error!("CRITICAL DB ERROR for file {}: {}", last_filename, e); }
                 }
             }
         }
-        // Schreibe die Transaktion mit nur einem SSD-Zugriff endgültig in die Datenbank
+
         tx.commit().await.map_err(|e| e.to_string())?;
+
+        // Progress an Frontend senden, sobald der Chunk sicher auf der SSD liegt
+        scanned_so_far += chunk_len;
+        let _ = app.emit("scan-progress", ScanProgressPayload {
+            total: total_files,
+            current: scanned_so_far,
+            current_file: last_filename,
+        });
     }
 
+    tracing::info!("Directory scan complete. Added {} new files to the database.", processed_count);
     Ok(processed_count)
 }
 
-// Wird vom unsichtbaren Background-Watcher aufgerufen
 pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
     let p_clone = path.clone();
-
-    // CPU-Analyse im Hintergrund-Thread (Hashen, DSP, etc.)
     let analysis_res = tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&p_clone)).await;
 
     if let Ok(Ok(analysis)) = analysis_res {
         let id = Uuid::new_v4().to_string();
+        let filename = analysis.filename.clone();
 
-        // Lautloser Insert in die Datenbank (FTS5 Trigger laufen automatisch mit!)
-        let _ = sqlx::query(
+        let insert_result = sqlx::query(
             r#"
             INSERT OR IGNORE INTO samples (
                 id, file_hash, original_path, filename, extension, file_size,
@@ -177,5 +208,13 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             .bind(&analysis.waveform_data)
             .execute(&pool)
             .await;
+
+        if let Err(e) = insert_result {
+            tracing::error!("CRITICAL DB ERROR for file {}: {}", filename, e);
+        } else {
+            tracing::info!("Successfully processed background ghost-scan for file: {}", filename);
+        }
+    } else {
+        tracing::error!("Failed to analyze single file: {:?}", path);
     }
 }

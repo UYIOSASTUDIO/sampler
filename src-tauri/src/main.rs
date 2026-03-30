@@ -13,8 +13,13 @@ use tauri::Manager;
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init()) // NEU: Aktiviert den direkten File-Stream
+        .plugin(tauri_plugin_fs::init()) // Aktiviert den direkten File-Stream
         .setup(|app_handle| {
+            // 1. Enterprise Logger initialisieren und im Speicher verankern
+            let log_guard = app::logger::setup_logging(app_handle);
+            app_handle.manage(log_guard);
+
+            // 2. App Data Directory für die Datenbank auflösen
             let app_dir = app_handle
                 .path()
                 .app_data_dir()
@@ -27,13 +32,15 @@ fn main() {
 
             let db_path = app_dir.join("samplevault.db");
 
+            // 3. Datenbank asynchron initialisieren und State registrieren
             tauri::async_runtime::block_on(async move {
                 match db::init_db(&db_path).await {
                     Ok(pool) => {
                         app_handle.manage(AppState::new(pool));
-                        println!("Database initialized successfully at: {:?}", db_path);
+                        tracing::info!("Database initialized successfully at: {:?}", db_path);
                     }
                     Err(e) => {
+                        tracing::error!("Critical: Database initialization failed: {}", e);
                         panic!("Critical: Database initialization failed: {}", e);
                     }
                 }
@@ -42,9 +49,13 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            app::commands::scan_library,
-            app::commands::get_samples,
-            app::commands::clear_database
+            commands::scan_library,
+            commands::rescan_all_folders,
+            commands::get_samples,
+            commands::clear_database,
+            commands::cleanup_database,
+            commands::remove_folder,
+            commands::get_connected_folders
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");

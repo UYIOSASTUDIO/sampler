@@ -45,7 +45,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS samples_fts USING fts5(
     tokenize = 'unicode61'
 );
 
--- 4. FTS5 SYNCHRONISATION TRIGGERS (Korrigiert)
+-- 4. FTS5 SYNCHRONISATION TRIGGERS
 CREATE TRIGGER IF NOT EXISTS samples_ai AFTER INSERT ON samples BEGIN
     INSERT INTO samples_fts(id, filename, original_path, instrument_type)
     VALUES (new.id, new.filename, new.original_path, new.instrument_type);
@@ -60,3 +60,9 @@ DELETE FROM samples_fts WHERE id = old.id;
 INSERT INTO samples_fts(id, filename, original_path, instrument_type)
 VALUES (new.id, new.filename, new.original_path, new.instrument_type);
 END;
+
+-- 5. CONNECTED FOLDERS
+CREATE TABLE IF NOT EXISTS connected_folders (
+                                                 path TEXT PRIMARY KEY NOT NULL,
+                                                 added_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
