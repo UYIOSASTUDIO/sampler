@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
+    import { onMount, onDestroy, tick } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { convertFileSrc } from '@tauri-apps/api/core';
@@ -67,6 +67,7 @@
 
     // --- ZERO-LATENCY WEB AUDIO API & RAM CACHE ---
     let audioCtx: AudioContext;
+    let gainNode: GainNode; // NEU: Der globale Lautstärkeregler
     let sourceNode: AudioBufferSourceNode | null = null;
     let playingId: string | null = $state(null);
     let selectedId: string | null = $state(null);
@@ -82,26 +83,23 @@
     const instrumentTypes = ["Kick", "Snare", "Clap", "HiHat", "Cymbal", "Percussion", "Bass", "Vocal", "FX", "Synth", "Loop"];
 
     // --- PROGRESS BAR STATE ---
-    type ScanProgressPayload = {
-        total: number;
-        current: number;
-        current_file: string;
-    };
-
+    type ScanProgressPayload = { total: number; current: number; current_file: string; };
     let scanTotal: number = $state(0);
     let scanCurrent: number = $state(0);
     let scanCurrentFile: string = $state('');
-
     let scanPercentage = $derived(scanTotal > 0 ? Math.round((scanCurrent / scanTotal) * 100) : 0);
 
     function updateProgress() {
         if (playingId && currentSampleDuration > 0 && audioCtx) {
             const elapsed = audioCtx.currentTime - playbackStartTime;
-            playbackProgress = elapsed / currentSampleDuration;
 
-            if (playbackProgress >= 1.0) {
-                playbackProgress = 1.0;
-                playingId = null;
+            const progress = Math.min(elapsed / currentSampleDuration, 1.0);
+
+            // DER FIX: Lokalen UND globalen State gleichzeitig aktualisieren
+            playbackProgress = progress;
+            appState.playbackProgress = progress;
+
+            if (progress >= 1.0) {
                 cancelAnimationFrame(animationFrameId);
             } else {
                 animationFrameId = requestAnimationFrame(updateProgress);
@@ -110,30 +108,49 @@
     }
 
     onMount(async () => {
-        // @ts-ignore Safari Fallback
+        // @ts-ignore
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AudioContextClass();
+
+        // Master Volume Node initialisieren
+        gainNode = audioCtx.createGain();
+        gainNode.connect(audioCtx.destination);
+        gainNode.gain.value = appState.globalVolume;
+
         window.addEventListener('keydown', handleKeydown);
 
         try {
-            const removed = await invoke<number>('cleanup_database');
-            if (removed > 0) console.log(`Garbage Collection: Cleaned up ${removed} orphaned files.`);
-        } catch (e) {
-            console.error(e);
+            await invoke<number>('cleanup_database');
+            await loadSamples();
+        } catch (e) { console.error(e); }
+
+        await listen('library-updated', () => loadSamples());
+        await listen<ScanProgressPayload>('scan-progress', (e) => {
+            scanTotal = e.payload.total; scanCurrent = e.payload.current; scanCurrentFile = e.payload.current_file;
+        });
+    });
+
+    // Reagiere live auf den Fader im Footer
+    $effect(() => {
+        if (gainNode) gainNode.gain.value = appState.globalVolume;
+    });
+
+    // Reagiere auf die Buttons im Footer
+    let lastToggle = $state(0); let lastNext = $state(0); let lastPrev = $state(0);
+    $effect(() => {
+        if (appState.cmdTogglePlay > lastToggle) {
+            lastToggle = appState.cmdTogglePlay;
+            if (appState.currentSample) {
+                if (appState.isPlaying) {
+                    if (sourceNode) { sourceNode.onended = null; sourceNode.stop(); }
+                    appState.isPlaying = false; playingId = null; cancelAnimationFrame(animationFrameId);
+                } else {
+                    handlePlayRequest(appState.currentSample, true);
+                }
+            }
         }
-
-        await loadSamples();
-
-        await listen('library-updated', () => {
-            console.log("OS-Level change detected. Refreshing UI...");
-            loadSamples();
-        });
-
-        await listen<ScanProgressPayload>('scan-progress', (event) => {
-            scanTotal = event.payload.total;
-            scanCurrent = event.payload.current;
-            scanCurrentFile = event.payload.current_file;
-        });
+        if (appState.cmdNext > lastNext) { lastNext = appState.cmdNext; playNextSample(); }
+        if (appState.cmdPrev > lastPrev) { lastPrev = appState.cmdPrev; playPrevSample(); }
     });
 
     onDestroy(() => {
@@ -146,108 +163,209 @@
     async function loadSamples() {
         isLoading = true;
         try {
-            const response = await invoke<PaginatedResponse>('get_samples', {
-                filterType: activeTypeFilter,
-                searchQuery: searchQuery.trim() !== '' ? searchQuery.trim() : null,
-                page: currentPage,
-                pageSize: pageSize
-            });
-            samples = response.samples;
-            totalItems = response.total_count;
-
-            if (scrollContainer) {
-                scrollContainer.scrollTop = 0;
-            }
-
-            if (sourceNode) {
-                sourceNode.stop();
-                playingId = null;
-            }
-        } catch (error) {
-            console.error("Failed to load samples", error);
-        } finally {
-            isLoading = false;
-        }
+            const response = await invoke<PaginatedResponse>('get_samples', { filterType: activeTypeFilter, searchQuery: searchQuery.trim() !== '' ? searchQuery.trim() : null, page: currentPage, pageSize: pageSize });
+            samples = response.samples; totalItems = response.total_count;
+            if (scrollContainer) scrollContainer.scrollTop = 0;
+            if (sourceNode) { sourceNode.stop(); playingId = null; }
+        } catch (error) { console.error(error); } finally { isLoading = false; }
     }
 
-    function handleKeydown(e: KeyboardEvent) {
+    // Ausgelagerte Navigations-Logik für Tasten UND Footer-Buttons
+    async function playNextSample() {
+        if (samples.length === 0) return;
+        let currentIndex = samples.findIndex(s => s.id === selectedId);
+
+        if (currentIndex === -1) {
+            // Nichts ausgewählt -> Starte beim ersten Sound der aktuellen Seite
+            currentIndex = 0;
+        } else if (currentIndex === samples.length - 1) {
+            // Am Ende angekommen -> Nächste Seite
+            if (currentPage < totalPages) {
+                currentPage++; await loadSamples();
+                if (samples.length > 0) {
+                    await handlePlayRequest(samples[0]);
+                    setTimeout(() => document.getElementById(`sample-${samples[0].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+                }
+            }
+            return;
+        } else {
+            currentIndex++;
+        }
+
+        await handlePlayRequest(samples[currentIndex]);
+        setTimeout(() => document.getElementById(`sample-${samples[currentIndex].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+    }
+
+    async function playPrevSample() {
+        if (samples.length === 0) return;
+        let currentIndex = samples.findIndex(s => s.id === selectedId);
+
+        if (currentIndex === -1) {
+            // Nichts ausgewählt -> Starte beim letzten Sound der aktuellen Seite
+            currentIndex = samples.length - 1;
+        } else if (currentIndex === 0) {
+            // Am Anfang angekommen -> Vorherige Seite
+            if (currentPage > 1) {
+                currentPage--; await loadSamples();
+                if (samples.length > 0) {
+                    await handlePlayRequest(samples[samples.length - 1]);
+                    setTimeout(() => document.getElementById(`sample-${samples[samples.length - 1].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+                }
+            }
+            return;
+        } else {
+            currentIndex--;
+        }
+
+        await handlePlayRequest(samples[currentIndex]);
+        setTimeout(() => document.getElementById(`sample-${samples[currentIndex].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+    }
+
+    // --- ENTERPRISE KEYBOARD NAVIGATION ---
+    async function handleKeydown(e: KeyboardEvent) {
         if (document.activeElement?.tagName === 'INPUT') return;
+
+        if (isLoading) {
+            if (['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+                e.preventDefault();
+            }
+            return;
+        }
 
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
             e.preventDefault();
             if (samples.length === 0) return;
 
             let currentIndex = samples.findIndex(s => s.id === selectedId);
+
             if (e.key === 'ArrowDown') {
-                currentIndex = currentIndex === -1 ? 0 : Math.min(samples.length - 1, currentIndex + 1);
-            } else {
-                currentIndex = currentIndex === -1 ? 0 : Math.max(0, currentIndex - 1);
+                if (currentIndex === -1) {
+                    // Start at the very first sample
+                    currentIndex = 0;
+                } else if (currentIndex === samples.length - 1) {
+                    // Next page
+                    if (currentPage < totalPages) {
+                        currentPage++;
+                        await loadSamples();
+                        if (samples.length > 0) {
+                            const nextSample = samples[0];
+                            await handlePlayRequest(nextSample);
+                            await tick();
+                            document.getElementById(`sample-${nextSample.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        }
+                    }
+                    return;
+                } else {
+                    currentIndex++;
+                }
+            } else if (e.key === 'ArrowUp') {
+                if (currentIndex === -1) {
+                    // Start at the very last sample (oder 0, aber unten macht mehr Sinn beim Hochscrollen)
+                    currentIndex = samples.length - 1;
+                } else if (currentIndex === 0) {
+                    // Previous page
+                    if (currentPage > 1) {
+                        currentPage--;
+                        await loadSamples();
+                        if (samples.length > 0) {
+                            const nextSample = samples[samples.length - 1];
+                            await handlePlayRequest(nextSample);
+                            await tick();
+                            document.getElementById(`sample-${nextSample.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        }
+                    }
+                    return;
+                } else {
+                    currentIndex--;
+                }
             }
 
             const nextSample = samples[currentIndex];
             handlePlayRequest(nextSample);
 
+            await tick();
             const element = document.getElementById(`sample-${nextSample.id}`);
             if (element) {
                 element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             }
+
+        } else if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            if (!selectedId) return;
+
+            const currentSample = samples.find(s => s.id === selectedId);
+            if (!currentSample) return;
+
+            // Retrigger (Neustart)
+            handlePlayRequest(currentSample, true);
+
+        } else if (e.key === ' ') {
+            // Leertaste für Play/Pause
+            e.preventDefault();
+            if (!selectedId) return;
+
+            const currentSample = samples.find(s => s.id === selectedId);
+            if (!currentSample) return;
+
+            handlePlayRequest(currentSample);
         }
     }
 
-    async function handlePlayRequest(sample: SampleRecord) {
+    async function handlePlayRequest(sample: SampleRecord, forceRestart: boolean = false) {
         selectedId = sample.id;
 
-        if (playingId === sample.id) {
-            if (sourceNode) sourceNode.stop();
-            playingId = null;
-            cancelAnimationFrame(animationFrameId);
+        if (playingId === sample.id && !forceRestart) {
+            if (sourceNode) { sourceNode.onended = null; sourceNode.stop(); }
+            playingId = null; appState.isPlaying = false; appState.playbackProgress = 0; cancelAnimationFrame(animationFrameId);
             return;
         }
 
-        if (sourceNode) sourceNode.stop();
+        if (sourceNode) { sourceNode.onended = null; try { sourceNode.stop(); } catch(e) {} }
         cancelAnimationFrame(animationFrameId);
 
         playingId = sample.id;
-        playbackProgress = 0;
+        appState.playbackProgress = 0; // Harter Reset für das neue Sample
 
         let audioBuffer = audioRamCache.get(sample.id);
-
         if (!audioBuffer) {
             try {
                 const assetUrl = convertFileSrc(sample.original_path);
                 const response = await fetch(assetUrl);
-                const arrayBuffer = await response.arrayBuffer();
-                audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-                if (audioRamCache.size >= 200) {
-                    const firstKey = audioRamCache.keys().next().value;
-                    if (firstKey) audioRamCache.delete(firstKey);
-                }
+                audioBuffer = await audioCtx.decodeAudioData(await response.arrayBuffer());
+                if (audioRamCache.size >= 200) { const firstKey = audioRamCache.keys().next().value; if (firstKey) audioRamCache.delete(firstKey); }
                 audioRamCache.set(sample.id, audioBuffer);
-            } catch (error) {
-                console.error("Audio decoding failed:", error);
-                playingId = null;
-                return;
-            }
+            } catch (error) { console.error(error); playingId = null; return; }
         }
 
         if (playingId !== sample.id) return;
 
+        appState.currentSample = sample;
+        appState.isPlaying = true;
+
         sourceNode = audioCtx.createBufferSource();
         sourceNode.buffer = audioBuffer;
-        sourceNode.connect(audioCtx.destination);
+        sourceNode.connect(gainNode);
 
         sourceNode.onended = () => {
             if (playingId === sample.id) {
+                // DER FIX: 1. Zwinge die Anzeige auf exakt 100% am rechten Rand
+                appState.playbackProgress = 1.0;
                 playingId = null;
-                playbackProgress = 0;
+                appState.isPlaying = false;
                 cancelAnimationFrame(animationFrameId);
+
+                // DER FIX: 2. Warte 150ms, damit der User das Ende sieht, bevor der Balken auf 0 springt
+                setTimeout(() => {
+                    // Nur auf 0 setzen, wenn der User in diesen 150ms nicht schon ein anderes Sample gestartet hat
+                    if (!appState.isPlaying) {
+                        appState.playbackProgress = 0;
+                    }
+                }, 150);
             }
         };
 
         currentSampleDuration = audioBuffer.duration;
         playbackStartTime = audioCtx.currentTime;
-
         sourceNode.start(0);
         animationFrameId = requestAnimationFrame(updateProgress);
     }
@@ -292,7 +410,7 @@
     }
 
     // --- SETTINGS MODAL LOGIC ---
-    let activeSettingsTab: 'general' | 'library' | 'audio' = $state('general'); // NEU
+    let activeSettingsTab: 'general' | 'library' | 'audio' = $state('general');
     let connectedFolders: string[] = $state([]);
     let isSettingsLoading: boolean = $state(false);
 
@@ -337,8 +455,9 @@
 
 {#if appState.currentView === 'sounds'}
 
-    <div class="flex flex-col h-full overflow-hidden">
-        <div class="px-8 pt-8 shrink-0">
+    <div class="h-full w-full overflow-y-auto" bind:this={scrollContainer}>
+
+        <div class="px-8 pt-8 pb-2">
             <div class="mb-6 flex items-end justify-between border-b border-zinc-200 pb-0 dark:border-zinc-800">
 
                 <div class="flex-1">
@@ -415,7 +534,7 @@
             <div class="mb-4 space-y-4">
                 <div class="flex flex-wrap gap-2">
                     {#each filters as filter}
-                        <button class="flex items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium hover:bg-zinc-50 dark:border-zinc-700/50 dark:bg-zinc-800/30 dark:hover:bg-zinc-800 transition-colors">
+                        <button class="flex items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium hover:bg-zinc-50 dark:border-zinc-700/50 dark:bg-zinc-800/30 dark:hover:bg-zinc-800 transition-colors cursor-pointer">
                             {filter} <span class="text-[10px] opacity-50">▼</span>
                         </button>
                     {/each}
@@ -429,11 +548,11 @@
                 </div>
             </div>
 
-            <div class="mb-2 flex items-center justify-between text-sm text-zinc-500">
+            <div class="mb-4 flex items-center justify-between text-sm text-zinc-500">
                 <span>{#if isLoading}Loading...{:else}{totalItems} results{/if}</span>
                 <div class="flex items-center gap-2">
                     <span class="text-xs font-medium">Sort by:</span>
-                    <button class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">Most recent ▼</button>
+                    <button class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 cursor-pointer">Most recent ▼</button>
                 </div>
             </div>
 
@@ -444,7 +563,7 @@
             </div>
         </div>
 
-        <div class="flex-1 overflow-y-auto px-8 pb-8" bind:this={scrollContainer}>
+        <div class="px-8 pb-8">
             {#if isLoading}
                 <div class="flex justify-center items-center h-40 text-sm text-zinc-500 animate-pulse">Loading samples...</div>
             {:else}
@@ -492,8 +611,20 @@
                             <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
                             <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.key_signature || "--"}</div>
                             <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.bpm ? Math.round(sample.bpm) : "--"}</div>
-                            <div class="flex justify-center"><button class="text-zinc-400 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100 cursor-pointer"><Heart size={16} /></button></div>
-                            <div class="flex justify-center"><button class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors opacity-0 group-hover:opacity-100 cursor-pointer"><EllipsisVertical size={16} /></button></div>
+                            <div class="flex justify-center">
+                                <button
+                                        class="text-zinc-400 hover:text-red-500 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id ? 'opacity-100' : 'opacity-0'}"
+                                >
+                                    <Heart size={16} />
+                                </button>
+                            </div>
+                            <div class="flex justify-center">
+                                <button
+                                        class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id ? 'opacity-100' : 'opacity-0'}"
+                                >
+                                    <EllipsisVertical size={16} />
+                                </button>
+                            </div>
 
                         </div>
                     {/each}

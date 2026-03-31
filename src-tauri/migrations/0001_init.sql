@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS samples (
                                        key_confidence REAL,
                                        instrument_type TEXT,
                                        type_confidence REAL,
+
+    -- NEU FÜR DIE TAXONOMIE ENGINE:
+                                       tags TEXT NOT NULL DEFAULT '[]',
+                                       is_user_edited BOOLEAN NOT NULL DEFAULT 0,
+
                                        is_favorite BOOLEAN NOT NULL DEFAULT 0,
                                        play_count INTEGER NOT NULL DEFAULT 0,
                                        imported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -36,19 +41,20 @@ CREATE INDEX IF NOT EXISTS idx_samples_bpm ON samples(bpm);
 CREATE INDEX IF NOT EXISTS idx_samples_key ON samples(key_signature);
 CREATE INDEX IF NOT EXISTS idx_samples_imported ON samples(imported_at DESC);
 
--- 3. FTS5 VIRTUAL TABLE
+-- 3. FTS5 VIRTUAL TABLE (Erweitert um 'tags')
 CREATE VIRTUAL TABLE IF NOT EXISTS samples_fts USING fts5(
     id UNINDEXED,
     filename,
     original_path,
     instrument_type,
+    tags, -- NEU: Damit die blitzschnelle Suchleiste auch Tags findet!
     tokenize = 'unicode61'
 );
 
--- 4. FTS5 SYNCHRONISATION TRIGGERS
+-- 4. FTS5 SYNCHRONISATION TRIGGERS (Erweitert um 'tags')
 CREATE TRIGGER IF NOT EXISTS samples_ai AFTER INSERT ON samples BEGIN
-    INSERT INTO samples_fts(id, filename, original_path, instrument_type)
-    VALUES (new.id, new.filename, new.original_path, new.instrument_type);
+    INSERT INTO samples_fts(id, filename, original_path, instrument_type, tags)
+    VALUES (new.id, new.filename, new.original_path, new.instrument_type, new.tags);
 END;
 
 CREATE TRIGGER IF NOT EXISTS samples_ad AFTER DELETE ON samples BEGIN
@@ -57,8 +63,8 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS samples_au AFTER UPDATE ON samples BEGIN
 DELETE FROM samples_fts WHERE id = old.id;
-INSERT INTO samples_fts(id, filename, original_path, instrument_type)
-VALUES (new.id, new.filename, new.original_path, new.instrument_type);
+INSERT INTO samples_fts(id, filename, original_path, instrument_type, tags)
+VALUES (new.id, new.filename, new.original_path, new.instrument_type, new.tags);
 END;
 
 -- 5. CONNECTED FOLDERS

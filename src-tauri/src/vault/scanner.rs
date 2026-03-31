@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter}; // Für das Event-Streaming
 use crate::audio::{analyzer, classify, waveform};
+use crate::vault::taxonomy;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["wav", "mp3", "aiff", "flac", "ogg", "m4a"];
 
@@ -44,6 +45,7 @@ struct CpuAnalysisResult {
     bit_depth: i64,
     instrument_type: Option<String>,
     waveform_data: Vec<u8>,
+    tags_json: String,
 }
 
 fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
@@ -74,10 +76,20 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
         Err(_) => (0, 44100, 2, 16)
     };
 
+    // NEU: Hochperformante Taxonomie-Analyse
+    let engine = taxonomy::TaxonomyEngine::global();
+    let tags_array = engine.analyze(path, duration_ms);
+    let tags_json = serde_json::to_string(&tags_array).unwrap_or_else(|_| "[]".to_string());
+
+    // Fallback für die alte Spalte (bis das Frontend umgebaut ist)
+    let instrument_type = tags_array.iter()
+        .find(|t| t["category"] == "Drums" || t["category"] == "Synth" || t["category"] == "Bass")
+        .map(|t| t["value"].as_str().unwrap_or("").to_string());
+
     Ok(CpuAnalysisResult {
         original_path, filename, extension, file_hash, file_size,
         duration_ms, sample_rate, channels, bit_depth, instrument_type,
-        waveform_data
+        waveform_data, tags_json
     })
 }
 
@@ -137,8 +149,8 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
                     r#"
                     INSERT OR IGNORE INTO samples (
                         id, file_hash, original_path, filename, extension, file_size,
-                        duration_ms, sample_rate, channels, bit_depth, instrument_type, waveform_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_ms, sample_rate, channels, bit_depth, instrument_type, tags, waveform_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
                 )
                     .bind(id)
@@ -152,6 +164,7 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
                     .bind(analysis.channels)
                     .bind(analysis.bit_depth)
                     .bind(&analysis.instrument_type)
+                    .bind(&analysis.tags_json)
                     .bind(&analysis.waveform_data)
                     .execute(&mut *tx)
                     .await;
@@ -188,11 +201,11 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
 
         let insert_result = sqlx::query(
             r#"
-            INSERT OR IGNORE INTO samples (
-                id, file_hash, original_path, filename, extension, file_size,
-                duration_ms, sample_rate, channels, bit_depth, instrument_type, waveform_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#
+                    INSERT OR IGNORE INTO samples (
+                        id, file_hash, original_path, filename, extension, file_size,
+                        duration_ms, sample_rate, channels, bit_depth, instrument_type, tags, waveform_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "#
         )
             .bind(id)
             .bind(&analysis.file_hash)
@@ -205,6 +218,7 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             .bind(analysis.channels)
             .bind(analysis.bit_depth)
             .bind(&analysis.instrument_type)
+            .bind(&analysis.tags_json)
             .bind(&analysis.waveform_data)
             .execute(&pool)
             .await;

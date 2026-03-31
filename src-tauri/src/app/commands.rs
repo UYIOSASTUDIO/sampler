@@ -247,3 +247,13 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
 
     Ok(removed)
 }
+
+// 8. REVEAL IN FINDER: Öffnet den Ordner und markiert das Sample
+#[tauri::command]
+pub fn reveal_in_finder(path: String) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(format!("/select,\"{}\"", path)).spawn();
+}

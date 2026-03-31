@@ -191,9 +191,11 @@
 
 /* Verhindert das "Rubber-Banding" / Zurückschnappen des Mac-Webviews */
 html, body {
+	width: 100%;
+	height: 100%;
+	background-color: transparent !important; /* Lässt das native macOS-Fenster durchscheinen */
 	overscroll-behavior: none;
-	overflow: hidden; /* Die App ist 100vh groß, nur innere Container dürfen scrollen */
-	/* Verhindert Text-Auswahl beim schnellen Klicken, was sich ebenfalls nach Webseite anfühlt */
+	overflow: hidden;
 	user-select: none;
 	-webkit-user-select: none;
 }
@@ -202,4 +204,15 @@ html, body {
 input, textarea {
 	user-select: auto;
 	-webkit-user-select: auto;
+}
+
+/* Native OS Window Dragging (Kugelsicher) */
+.drag-region {
+	-webkit-app-region: drag;
+}
+
+/* WICHTIG: Interaktive Elemente (Buttons, Inputs) dürfen NICHT draggable sein,
+   sonst kann man sie nicht mehr anklicken oder Text markieren! */
+.no-drag {
+	-webkit-app-region: no-drag;
 }

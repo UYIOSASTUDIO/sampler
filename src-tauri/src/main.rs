@@ -55,7 +55,8 @@ fn main() {
             commands::clear_database,
             commands::cleanup_database,
             commands::remove_folder,
-            commands::get_connected_folders
+            commands::get_connected_folders,
+            commands::reveal_in_finder
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");
