@@ -8,6 +8,9 @@ export const appState = $state({
     activeSoundsTab: 'samples' as 'samples' | 'collections',
 
     globalKey: null as string | null,
+    // 'min' | 'maj' — bestimmt ob der globale Key als Minor oder Major interpretiert wird.
+    // Beeinflusst die Relative-Key-Logik im Pitch-Shifter (z.B. D min → F maj für Major-Samples).
+    globalKeyMode: 'min' as 'min' | 'maj',
 
     isCreateCollectionModalOpen: false,
     themePreference: 'system' as 'light' | 'dark' | 'system',

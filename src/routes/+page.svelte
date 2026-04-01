@@ -4,7 +4,7 @@
     import { listen } from '@tauri-apps/api/event';
     import { convertFileSrc } from '@tauri-apps/api/core';
     import { open } from '@tauri-apps/plugin-dialog';
-    import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus } from 'lucide-svelte';
+    import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus, Music2 } from 'lucide-svelte';
     import { appState } from '$lib/store.svelte';
 
     type SampleRecord = {
@@ -393,22 +393,80 @@
     // --- ENTERPRISE PITCH CALCULATION ---
     const CHROMATIC_SCALE = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 
-    function getSemitoneShift(sampleKey: string | null, targetKey: string | null): number {
-        if (!sampleKey || !targetKey) return 0;
+    // Leitet den Mode ('min' | 'maj') aus einem key_signature String ab.
+    // Unterstützt: "C min", "D# minor", "F maj", "G major", Camelot "8A"(min)/"8B"(maj).
+    function parseKeyMode(keyStr: string): 'min' | 'maj' {
+        const lower = keyStr.toLowerCase().trim();
+        if (/\d+a$/.test(lower)) return 'min';    // Camelot: 8A → minor
+        if (/\d+b$/.test(lower)) return 'maj';    // Camelot: 8B → major
+        if (lower.includes('min')) return 'min';
+        return 'maj'; // Default: Major (auch für reine Noten wie "C" ohne Mode-Angabe)
+    }
 
-        // Extrahiere nur die reine Note (Ignoriere vorerst 'min' oder 'maj')
-        const sNote = sampleKey.split(' ')[0].toUpperCase();
-        const tNote = targetKey.split(' ')[0].toUpperCase();
+    // Extrahiert nur die Grund-Note aus einem key_signature String.
+    // "D# min" → "D#" | "Fmaj" → "F" | "8A" → chromatisch gelöst via Camelot-Map
+    function parseKeyNote(keyStr: string): string {
+        // Camelot-Format: Zahl + A/B → Note über Camelot-Wheel
+        const camelotMatch = keyStr.match(/^(1[0-2]|[1-9])([AB])$/i);
+        if (camelotMatch) {
+            const CAMELOT_TO_NOTE: Record<string, string> = {
+                '1A':'Ab','1B':'B','2A':'Eb','2B':'F#','3A':'Bb','3B':'Db',
+                '4A':'F','4B':'Ab','5A':'C','5B':'Eb','6A':'G','6B':'Bb',
+                '7A':'D','7B':'F','8A':'A','8B':'C','9A':'E','9B':'G',
+                '10A':'B','10B':'D','11A':'F#','11B':'A','12A':'Db','12B':'E'
+            };
+            const key = camelotMatch[1].toUpperCase() + camelotMatch[2].toUpperCase();
+            return CAMELOT_TO_NOTE[key] ?? '';
+        }
+        // Normales Format: erste Token ist die Note ("D#", "C", "F")
+        return keyStr.trim().split(/\s+/)[0].toUpperCase();
+    }
+
+    /**
+     * Berechnet den optimalen Pitch-Shift in Halbtönen zwischen einem Sample-Key
+     * und einem Ziel-Key unter Berücksichtigung der Relative-Key-Logik:
+     *
+     *   Ziel = D min, Sample = F maj  →  0 Halbtöne (selbe Skala, Parallele)
+     *   Ziel = D min, Sample = C maj  →  +5 Halbtöne (C→F, da Fmaj = Relativ-Major von Dmin)
+     *   Ziel = F maj, Sample = D min  →  0 Halbtöne (selbe Skala)
+     *
+     * Relative-Major ist immer 3 Halbtöne ÜBER dem Moll-Grundton.
+     * Relative-Minor ist immer 3 Halbtöne UNTER dem Dur-Grundton.
+     */
+    function getSemitoneShift(
+        sampleKey: string | null,
+        targetNote: string | null,
+        targetMode: 'min' | 'maj'
+    ): number {
+        if (!sampleKey || !targetNote) return 0;
+
+        const RELATIVE_SEMITONES = 3; // Durton liegt immer 3 HT über dem Mollton
+
+        const sNote = parseKeyNote(sampleKey);
+        const sMode = parseKeyMode(sampleKey);
 
         const sIdx = CHROMATIC_SCALE.indexOf(sNote);
-        const tIdx = CHROMATIC_SCALE.indexOf(tNote);
+        let tIdx  = CHROMATIC_SCALE.indexOf(targetNote.toUpperCase());
 
         if (sIdx === -1 || tIdx === -1) return 0;
 
+        // Relative-Key-Anpassung: Wenn Sample und Ziel unterschiedliche Modi haben,
+        // pitchen wir das Sample auf den Relativ-Key des Ziels (gleiche Skala, anderer Startpunkt).
+        if (targetMode === 'min' && sMode === 'maj') {
+            // Ziel: Moll → Relativ-Dur des Ziels = tNote + 3 HT
+            // Beispiel: Ziel D min → Relativ-Dur = F maj → Major-Sample auf F pitchen
+            tIdx = (tIdx + RELATIVE_SEMITONES) % 12;
+        } else if (targetMode === 'maj' && sMode === 'min') {
+            // Ziel: Dur → Relativ-Moll des Ziels = tNote − 3 HT
+            // Beispiel: Ziel F maj → Relativ-Moll = D min → Minor-Sample auf D pitchen
+            tIdx = (tIdx - RELATIVE_SEMITONES + 12) % 12;
+        }
+        // Gleicher Modus: keine Anpassung nötig
+
         let diff = tIdx - sIdx;
 
-        // Shortest Path Logic: Niemals mehr als 6 Halbtöne pitchen
-        if (diff > 6) diff -= 12;
+        // Shortest Path: Niemals mehr als 6 Halbtöne pitchen (natürlichster Klang)
+        if (diff > 6)  diff -= 12;
         if (diff < -6) diff += 12;
 
         return diff;
@@ -433,7 +491,9 @@
 
         let semitones = 0;
         if (appState.globalKey && sample.key_signature) {
-            semitones = getSemitoneShift(sample.key_signature, appState.globalKey);
+            // Relative-Key-Logik: globalKeyMode bestimmt ob Dur- oder Moll-Samples
+            // auf den Relativ-Key gepitched werden (gleiche Skala, anderer Startpunkt).
+            semitones = getSemitoneShift(sample.key_signature, appState.globalKey, appState.globalKeyMode);
         }
 
         currentSampleDuration = sample.duration_ms / 1000; // Umrechnung in Sekunden
@@ -519,7 +579,8 @@
     }
 
     // --- FILTER UI STATE ---
-    let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | null = $state(null);
+    // 'globalkey' ist das Piano-Dropdown für den globalen Pitch-Key im Player-Header
+    let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | null = $state(null);
     const whiteKeys = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
     const blackKeys = [
         { note: 'C#', left: '14.28%' }, { note: 'D#', left: '28.56%' }, { note: 'F#', left: '57.12%' }, { note: 'G#', left: '71.40%' }, { note: 'A#', left: '85.68%' }
@@ -561,6 +622,27 @@
     }
 
     function isPianoKeyActive(note: string) { return currentBaseNote === note; }
+
+    // --- GLOBAL KEY PIANO (Pitch-Shifter im Header) ---
+    // Setzt den globalen Pitch-Key. Schließt das Dropdown nicht automatisch —
+    // der User sieht sofort die Piano-Selektion und kann den Mode wechseln.
+    function setGlobalPianoKey(note: string) {
+        // Nochmals dieselbe Note → Toggle off
+        if (appState.globalKey === note) {
+            appState.globalKey = null;
+        } else {
+            appState.globalKey = note;
+        }
+    }
+
+    function isGlobalKeyActive(note: string) { return appState.globalKey === note; }
+
+    // Lesbarer Label für den Trigger-Button: "D min", "F# maj", "Off"
+    let globalKeyLabel = $derived(
+        appState.globalKey
+            ? `${appState.globalKey} ${appState.globalKeyMode}`
+            : 'Off'
+    );
     function toggleTagMatchMode() { appState.filters.tagMatchMode = appState.filters.tagMatchMode === 'AND' ? 'OR' : 'AND'; currentPage = 1; loadSamples(); }
 
     let isTagsExpanded: boolean = $state(false);
@@ -744,43 +826,6 @@
                             <button onclick={() => { appState.activeSoundsTab = 'collections'; appState.filters.collectionId = null; appState.filters.onlyLiked = false; }} class="pb-2 text-sm font-semibold transition-colors cursor-pointer {appState.activeSoundsTab === 'collections' ? 'border-b-2 border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100' : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 border-b-2 border-transparent'}">Collections</button>
                         </div>
 
-                        <div class="mt-4 flex items-center gap-2">
-                            <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Project Key:</span>
-                            <div class="relative">
-                                <button
-                                        onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalkey' ? null : 'globalkey'; }}
-                                        class="flex h-7 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-bold transition-colors cursor-pointer {appState.globalKey ? 'border-emerald-500 text-emerald-600 bg-emerald-50 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}"
-                                >
-                                    {appState.globalKey || 'Off'}
-                                    <ChevronDown size={14} class="opacity-50" />
-                                </button>
-
-                                {#if openDropdown === 'globalkey'}
-                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 w-48 flex-col rounded-lg border border-zinc-200 bg-white p-2 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                        <button
-                                                onclick={() => { appState.globalKey = null; openDropdown = null; }}
-                                                class="w-full text-left rounded-md px-2 py-1.5 text-xs font-semibold text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 cursor-pointer transition-colors mb-1"
-                                        >
-                                            Turn Off
-                                        </button>
-                                        <div class="grid grid-cols-4 gap-1">
-                                            {#each CHROMATIC_SCALE as note}
-                                                <button
-                                                        onclick={() => { appState.globalKey = note; openDropdown = null; }}
-                                                        class="flex items-center justify-center rounded border border-zinc-200 bg-zinc-50 py-1.5 text-xs font-bold text-zinc-700 hover:border-emerald-500 hover:text-emerald-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:border-emerald-500 dark:hover:text-emerald-400 transition-all cursor-pointer {appState.globalKey === note ? 'border-emerald-500 bg-emerald-50 text-emerald-600 dark:border-emerald-500/50 dark:bg-emerald-900/30 dark:text-emerald-400' : ''}"
-                                                >
-                                                    {note}
-                                                </button>
-                                            {/each}
-                                        </div>
-                                    </div>
-                                {/if}
-                            </div>
-
-                            {#if appState.globalKey}
-                                <span class="text-[10px] text-emerald-600/70 dark:text-emerald-400/70 ml-1 font-medium italic animate-pulse">Auto-Pitch active</span>
-                            {/if}
-                        </div>
                     </div>
                     <div class="flex flex-col items-end gap-3 pb-2">
                         {#if isScanning && scanTotal > 0}
@@ -912,6 +957,102 @@
                             {#if appState.filters.instruments.length > 0 || appState.filters.genres.length > 0 || appState.filters.formats.length > 0 || appState.filters.keys.length > 0 || appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}
                                 <button onclick={clearAllFilters} class="ml-2 flex h-8 items-center text-xs font-semibold text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 transition-colors cursor-pointer">Clear all</button>
                             {/if}
+
+                            <!-- ─── PITCH PILL ──────────────────────────────────────────────────────── -->
+                            <!-- Vertikaler Divider: signalisiert "andere Kategorie" als die Filter -->
+                            <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
+
+                            <div class="relative shrink-0">
+                                <!-- Trigger: Pill-Form + Emerald-Akzent unterscheidet es klar von normalen Filtern -->
+                                <button
+                                    onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalkey' ? null : 'globalkey'; }}
+                                    class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
+                                           {appState.globalKey
+                                               ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm shadow-emerald-500/30 dark:shadow-emerald-500/20'
+                                               : 'border-emerald-500/40 bg-emerald-50 text-emerald-700 hover:border-emerald-500 hover:bg-emerald-100 dark:border-emerald-500/20 dark:bg-emerald-500/5 dark:text-emerald-400 dark:hover:border-emerald-500/50 dark:hover:bg-emerald-500/10'}"
+                                >
+                                    <Music2 size={13} class="shrink-0 {appState.globalKey ? 'opacity-100' : 'opacity-70'}" />
+                                    <span>{globalKeyLabel}</span>
+                                    {#if !appState.globalKey}
+                                        <ChevronDown size={12} class="opacity-50" />
+                                    {:else}
+                                        <!-- Aktiv-Pulse zeigt dass Auto-Pitch läuft -->
+                                        <span class="relative flex h-1.5 w-1.5 shrink-0">
+                                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                                            <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
+                                        </span>
+                                    {/if}
+                                </button>
+
+                                <!-- Piano-Dropdown -->
+                                {#if openDropdown === 'globalkey'}
+                                    <div
+                                        onclick={(e) => e.stopPropagation()}
+                                        class="absolute right-0 top-full mt-2 flex w-72 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50"
+                                    >
+                                        <!-- Header -->
+                                        <div class="flex items-center gap-2 pb-1 border-b border-zinc-100 dark:border-zinc-800">
+                                            <Music2 size={13} class="text-emerald-500 shrink-0" />
+                                            <span class="text-[11px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Auto-Pitch Key</span>
+                                        </div>
+
+                                        <!-- Maj / Min Toggle -->
+                                        <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50">
+                                            <button
+                                                onclick={() => { appState.globalKeyMode = 'min'; }}
+                                                class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                       {appState.globalKeyMode === 'min'
+                                                           ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                           : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                            >Minor</button>
+                                            <button
+                                                onclick={() => { appState.globalKeyMode = 'maj'; }}
+                                                class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                       {appState.globalKeyMode === 'maj'
+                                                           ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                           : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                            >Major</button>
+                                        </div>
+
+                                        <!-- Piano Keyboard -->
+                                        <div class="relative flex w-full h-24 rounded-lg border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
+                                            {#each whiteKeys as note}
+                                                <button
+                                                    onclick={() => setGlobalPianoKey(note)}
+                                                    class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer
+                                                           {isGlobalKeyActive(note)
+                                                               ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                                                               : 'bg-white dark:bg-zinc-800 text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700'}"
+                                                >{note}</button>
+                                            {/each}
+                                            {#each blackKeys as bk}
+                                                <button
+                                                    onclick={() => setGlobalPianoKey(bk.note)}
+                                                    style="left: {bk.left}; transform: translateX(-50%);"
+                                                    class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10
+                                                           {isGlobalKeyActive(bk.note)
+                                                               ? 'bg-emerald-600 text-white shadow-inner'
+                                                               : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-700 dark:bg-black dark:hover:bg-zinc-900'}"
+                                                >{bk.note}</button>
+                                            {/each}
+                                        </div>
+
+                                        <!-- Hint Text -->
+                                        {#if appState.globalKey}
+                                            <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                Samples in <span class="font-semibold text-emerald-600 dark:text-emerald-400">{globalKeyLabel}</span> werden automatisch gepitched. {appState.globalKeyMode === 'min' ? 'Major-Samples' : 'Minor-Samples'} landen auf dem Relativ-{appState.globalKeyMode === 'min' ? 'Dur' : 'Moll'}.
+                                            </p>
+                                        {/if}
+
+                                        <!-- Turn Off -->
+                                        <button
+                                            onclick={() => { appState.globalKey = null; openDropdown = null; }}
+                                            class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
+                                        >Turn Off</button>
+                                    </div>
+                                {/if}
+                            </div>
+                            <!-- ─────────────────────────────────────────────────────────────────────── -->
 
                             <div class="ml-auto flex items-center gap-2">
                                 <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Match:</span>

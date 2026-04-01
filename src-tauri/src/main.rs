@@ -84,6 +84,7 @@ fn main() {
             commands::create_user_tag,
             commands::delete_user_tag,
             commands::get_all_available_tags,
+            commands::get_waveform,
             commands::play_audio,
             commands::stop_audio,
             commands::set_audio_volume

@@ -115,7 +115,6 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "futures",
- "hound",
  "log",
  "notify",
  "notify-debouncer-mini",
@@ -124,7 +123,6 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "ssstretch",
  "symphonia",

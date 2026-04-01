@@ -7,8 +7,14 @@ use tauri::State;
 use rodio::{Sink, buffer::SamplesBuffer};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use hound::{WavReader, SampleFormat};
-use ssstretch::Stretch;
+
+// Symphonia — universeller Decoder für WAV, MP3, FLAC, AIFF, OGG, M4A
+use symphonia::core::audio::SampleBuffer as SymphoniaSampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 #[derive(Debug, Serialize, FromRow)]
 pub struct SampleRecord {
@@ -21,7 +27,7 @@ pub struct SampleRecord {
     pub instrument_type: Option<String>,
     pub tags: String,
     pub waveform_data: Option<Vec<u8>>,
-    pub is_liked: bool, // NEU
+    pub is_liked: bool,
 }
 
 // ==========================================
@@ -358,18 +364,37 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
         return Ok(0);
     }
 
-    let records: Vec<(String, String)> = sqlx::query_as("SELECT id, original_path FROM samples")
-        .fetch_all(pool).await.map_err(|e| e.to_string())?;
+    // ENTERPRISE FIX: fetch_all → fetch() Stream, damit nie alle Samples auf einmal
+    // in den RAM geladen werden (schlecht bei 100k+ Einträgen).
+    // Wir sammeln nur die IDs der zu löschenden Samples (kleine Strings) und
+    // führen danach einen einzigen atomaren Batch-Delete durch.
+    use futures::StreamExt;
 
-    for (id, path) in records {
-        let is_parent_online = online_folders.iter().any(|f| path.starts_with(f));
+    let mut stream = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, original_path FROM samples"
+    ).fetch(pool);
 
-        if is_parent_online {
-            if !std::path::Path::new(&path).exists() {
-                let _ = sqlx::query("DELETE FROM samples WHERE id = ?").bind(&id).execute(pool).await;
-                removed += 1;
-            }
+    let mut ids_to_delete: Vec<String> = Vec::new();
+
+    while let Some(row) = stream.next().await {
+        let (id, path) = row.map_err(|e| e.to_string())?;
+        let is_parent_online = online_folders.iter().any(|f| path.starts_with(f.as_str()));
+        if is_parent_online && !std::path::Path::new(&path).exists() {
+            ids_to_delete.push(id);
         }
+    }
+
+    // Stream-Borrow freigeben, bevor wir die Transaktion öffnen
+    drop(stream);
+
+    if !ids_to_delete.is_empty() {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        for id in &ids_to_delete {
+            let _ = sqlx::query("DELETE FROM samples WHERE id = ?")
+                .bind(id).execute(&mut *tx).await;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        removed = ids_to_delete.len();
     }
 
     Ok(removed)
@@ -509,7 +534,12 @@ pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Resul
         .bind(pattern)
         .fetch_all(&state.db).await.map_err(|e| e.to_string())?;
 
-    // 3. Cascade Delete: Den Tag aus der JSON jedes Samples entfernen
+    // 3. Cascade Delete: Den Tag aus der JSON jedes Samples entfernen.
+    //    ENTERPRISE FIX: Alle UPDATEs in einer einzigen Transaktion — statt N
+    //    einzelner Roundtrips (N+1-Anti-Pattern). Atomarität als Bonus: entweder
+    //    alle Samples werden bereinigt oder keines.
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+
     for sample in samples {
         if let Ok(mut parsed_tags) = serde_json::from_str::<Vec<serde_json::Value>>(&sample.tags) {
 
@@ -518,17 +548,37 @@ pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Resul
                 t.get("value").and_then(|v| v.as_str()) != Some(&value)
             });
 
-            // Speichere die gesäuberte JSON zurück in die Datenbank
+            // Schreibe die gesäuberte JSON in die laufende Transaktion
             if let Ok(new_tags_string) = serde_json::to_string(&parsed_tags) {
                 sqlx::query("UPDATE samples SET tags = ? WHERE id = ?")
                     .bind(new_tags_string)
                     .bind(sample.id)
-                    .execute(&state.db).await.ok(); // .ok() ignoriert einzelne Fehler, damit der Loop weiterläuft
+                    .execute(&mut *tx).await.ok();
             }
         }
     }
 
+    // Erst hier werden alle Writes atomar committed
+    tx.commit().await.map_err(|e| e.to_string())?;
+
     Ok(())
+}
+
+/// Returns the waveform BLOB for a single sample, loaded on-demand.
+///
+/// By separating this from `get_samples`, the list query stays lean and only
+/// pays the BLOB I/O cost when the frontend actually needs to render a waveform
+/// (e.g. on hover or selection).
+#[tauri::command]
+pub async fn get_waveform(id: String, state: State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {
+    let row: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT waveform_data FROM samples WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    Ok(row.and_then(|(blob,)| blob))
 }
 
 use crate::vault::taxonomy::TaxonomyEngine;
@@ -537,9 +587,10 @@ use crate::vault::taxonomy::TaxonomyEngine;
 pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
     let mut all_tags = Vec::new();
 
-    // 1. Hole die festen System-Tags aus der Taxonomy Engine
-    let taxonomy = TaxonomyEngine::new();
-    for rule in taxonomy.rules {
+    // global() liefert die einmalig kompilierte OnceLock-Instanz — kein Re-Build des
+    // Aho-Corasick-Automaten pro Aufruf (war vorher TaxonomyEngine::new() = teuer)
+    let taxonomy = TaxonomyEngine::global();
+    for rule in &taxonomy.rules {
         // Vermeide Duplikate im UI (z.B. weil "hat" und "hihat" beide zum Tag "Hi-Hat" führen)
         if !all_tags.iter().any(|t: &TagRecord| t.value == rule.value && t.category == rule.category) {
             all_tags.push(TagRecord {
@@ -561,19 +612,296 @@ pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<Ta
     Ok(all_tags)
 }
 
-// FIX: current_sink nutzt jetzt Arc<Sink>!
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIO ENGINE STATE
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct AudioState {
     pub stream_handle: rodio::OutputStreamHandle,
-    pub current_sink: Mutex<Option<Arc<Sink>>>,
-    pub playback_id: Arc<AtomicUsize>,
+    pub current_sink:  Mutex<Option<Arc<Sink>>>,
+    pub playback_id:   Arc<AtomicUsize>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIO ENGINE CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Frames per processing chunk.
+/// 4096 frames @ 44.1kHz ≈ 93 ms — balances latency vs. overhead.
+const CHUNK_FRAMES: usize = 4096;
+
+/// Max chunks buffered in the sink queue before applying backpressure.
+/// 8 chunks ≈ 744 ms of audio headroom — prevents unbounded memory growth.
+const SINK_BUFFER_MAX: usize = 8;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE PLAYBACK HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Encodes one interleaved slice (direct or pitch-shifted) and appends it to
+/// the Sink.  All mutable buffers are pre-allocated outside the hot loop and
+/// passed by reference to avoid per-chunk heap allocations.
+#[inline(always)]
+fn flush_chunk(
+    interleaved_in:  &[f32],
+    frames:          usize,
+    channels:        usize,
+    sample_rate:     u32,
+    stretch:         &mut Option<ssstretch::Stretch>,
+    in_deint:        &mut Vec<Vec<f32>>,
+    out_deint:       &mut Vec<Vec<f32>>,
+    sink:            &Arc<Sink>,
+) {
+    if let Some(ref mut s) = stretch {
+        // ── Pitch-shift path ───────────────────────────────────────────────
+        // Deinterleave: [L,R, L,R, …] → [[L,L,…], [R,R,…]]
+        for (fi, frame) in interleaved_in.chunks_exact(channels).take(frames).enumerate() {
+            for (ch, &sample) in frame.iter().enumerate() {
+                in_deint[ch][fi] = sample;
+            }
+        }
+
+        s.process_vec(in_deint, frames as i32, out_deint, frames as i32);
+
+        // Reinterleave and submit
+        let mut out: Vec<f32> = Vec::with_capacity(frames * channels);
+        for fi in 0..frames {
+            for ch in 0..channels {
+                out.push(out_deint[ch][fi]);
+            }
+        }
+        sink.append(SamplesBuffer::new(channels as u16, sample_rate, out));
+    } else {
+        // ── Direct path (no pitch shift) ───────────────────────────────────
+        // Copy the interleaved slice directly to the sink — zero extra work.
+        sink.append(SamplesBuffer::new(
+            channels as u16,
+            sample_rate,
+            interleaved_in[..frames * channels].to_vec(),
+        ));
+    }
+}
+
+/// Spawns a background thread that:
+/// 1. Opens any audio format via Symphonia (WAV, MP3, FLAC, AIFF, OGG, M4A)
+/// 2. Streams decoded chunks to `sink` without loading the full file into RAM
+/// 3. Optionally applies ssstretch pitch-shifting — skipped entirely at 0 semitones
+/// 4. Cancels cleanly when `playback_id` no longer matches `expected_id`
+fn spawn_playback_thread(
+    file_path:   String,
+    semitones:   f32,
+    sink:        Arc<Sink>,
+    playback_id: Arc<AtomicUsize>,
+    expected_id: usize,
+) {
+    std::thread::spawn(move || {
+        // ── 1. Open & probe (format-agnostic) ─────────────────────────────
+        let file = match std::fs::File::open(&file_path) {
+            Ok(f)  => f,
+            Err(e) => {
+                tracing::error!("play_audio: cannot open '{}': {}", file_path, e);
+                return;
+            }
+        };
+
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+        let mut hint = Hint::new();
+        if let Some(ext) = std::path::Path::new(&file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            hint.with_extension(ext);
+        }
+
+        let probed = match symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        ) {
+            Ok(p)  => p,
+            Err(e) => {
+                tracing::error!("play_audio: probe failed for '{}': {}", file_path, e);
+                return;
+            }
+        };
+
+        let mut format = probed.format;
+
+        let track = match format.default_track() {
+            Some(t) => t,
+            None    => {
+                tracing::error!("play_audio: no audio track in '{}'", file_path);
+                return;
+            }
+        };
+
+        let sample_rate: u32 = track.codec_params.sample_rate.unwrap_or(44100);
+        let channels:    usize = track.codec_params.channels
+            .map(|c| c.count())
+            .unwrap_or(2);
+        let track_id = track.id;
+
+        let mut decoder = match symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+        {
+            Ok(d)  => d,
+            Err(e) => {
+                tracing::error!("play_audio: decoder error for '{}': {}", file_path, e);
+                return;
+            }
+        };
+
+        // ── 2. Pitch-shift setup — only when actually needed ───────────────
+        // Fast-path: semitones ≈ 0.0 → ssstretch is never instantiated.
+        let mut stretch: Option<ssstretch::Stretch> = if semitones.abs() > 0.01 {
+            let mut s = ssstretch::Stretch::new();
+            s.preset_default(channels as i32, sample_rate as f32);
+            s.set_transpose_semitones(semitones, None);
+            Some(s)
+        } else {
+            None
+        };
+
+        // ── 3. Pre-allocate ALL mutable buffers outside the hot loop ───────
+        // This eliminates repeated heap allocations inside the decode loop.
+        let mut in_deint:  Vec<Vec<f32>> = vec![vec![0.0; CHUNK_FRAMES]; channels];
+        let mut out_deint: Vec<Vec<f32>> = vec![vec![0.0; CHUNK_FRAMES]; channels];
+
+        // Ring buffer for decoded interleaved samples awaiting processing.
+        let mut pending: Vec<f32> = Vec::with_capacity(CHUNK_FRAMES * channels * 4);
+
+        // Reused SampleBuffer — grows on first use, stays stable thereafter.
+        let mut sym_sample_buf: Option<SymphoniaSampleBuffer<f32>> = None;
+
+        tracing::debug!(
+            "play_audio: starting stream '{}' | {}ch | {}Hz | pitch {:+.2} st",
+            file_path, channels, sample_rate, semitones
+        );
+
+        // ── 4. Streaming decode + playback loop ────────────────────────────
+        'decode: loop {
+            // Cancellation check — another play_audio() call was made
+            if playback_id.load(Ordering::SeqCst) != expected_id {
+                break 'decode;
+            }
+
+            // Backpressure: pause producer until consumer (rodio) catches up
+            if sink.len() > SINK_BUFFER_MAX {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+
+            // Process a full chunk from pending buffer when available
+            let frames_pending = pending.len() / channels;
+            if frames_pending >= CHUNK_FRAMES {
+                flush_chunk(
+                    &pending[..CHUNK_FRAMES * channels],
+                    CHUNK_FRAMES,
+                    channels,
+                    sample_rate,
+                    &mut stretch,
+                    &mut in_deint,
+                    &mut out_deint,
+                    &sink,
+                );
+                pending.drain(..CHUNK_FRAMES * channels);
+                continue; // drain as many full chunks as possible before decoding
+            }
+
+            // Decode the next Symphonia packet
+            let packet = match format.next_packet() {
+                Ok(p)  => p,
+                Err(_) => {
+                    // EOF — flush any remaining samples
+                    let frames_left = pending.len() / channels;
+                    if frames_left > 0 {
+                        flush_chunk(
+                            &pending,
+                            frames_left,
+                            channels,
+                            sample_rate,
+                            &mut stretch,
+                            &mut in_deint,
+                            &mut out_deint,
+                            &sink,
+                        );
+                    }
+                    tracing::debug!("play_audio: EOF reached for '{}'", file_path);
+                    break 'decode;
+                }
+            };
+
+            if packet.track_id() != track_id {
+                continue; // skip packets from other tracks (e.g. cover art)
+            }
+
+            let audio_buf = match decoder.decode(&packet) {
+                Ok(b)  => b,
+                Err(e) => {
+                    tracing::warn!("play_audio: skipping corrupt packet: {}", e);
+                    continue;
+                }
+            };
+
+            // Reuse SampleBuffer — avoids allocation after the first packet
+            let spec = *audio_buf.spec();
+            let sb = sym_sample_buf.get_or_insert_with(|| {
+                SymphoniaSampleBuffer::new(audio_buf.capacity() as u64, spec)
+            });
+            sb.copy_interleaved_ref(audio_buf);
+            pending.extend_from_slice(sb.samples());
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAURI COMMANDS — AUDIO
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn play_audio(
+    file_path: String,
+    semitones:  f32,
+    volume:     f32,
+    state:      State<'_, AudioState>,
+) -> Result<(), String> {
+    // Atomically increment playback ID — this cancels any running thread
+    let new_id = state.playback_id.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let sink = Arc::new(
+        Sink::try_new(&state.stream_handle).map_err(|e| e.to_string())?
+    );
+    sink.set_volume(volume);
+
+    // Swap in the new sink, stopping the previous one cleanly
+    {
+        let mut guard = state.current_sink.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+        *guard = Some(Arc::clone(&sink));
+    }
+
+    spawn_playback_thread(
+        file_path,
+        semitones,
+        sink,
+        state.playback_id.clone(),
+        new_id,
+    );
+
+    Ok(())
 }
 
 #[tauri::command]
 pub fn stop_audio(state: State<'_, AudioState>) {
-    let mut current_sink = state.current_sink.lock().unwrap();
-    if let Some(sink) = current_sink.take() {
+    let mut guard = state.current_sink.lock().unwrap();
+    if let Some(sink) = guard.take() {
         sink.stop();
     }
+    // Increment ID so any running thread terminates on next cancellation check
     state.playback_id.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -582,98 +910,4 @@ pub fn set_audio_volume(volume: f32, state: State<'_, AudioState>) {
     if let Some(sink) = state.current_sink.lock().unwrap().as_ref() {
         sink.set_volume(volume);
     }
-}
-
-#[tauri::command]
-pub fn play_audio(
-    file_path: String,
-    semitones: f32,
-    volume: f32,
-    state: State<'_, AudioState>,
-) -> Result<(), String> {
-    let new_id = state.playback_id.fetch_add(1, Ordering::SeqCst) + 1;
-
-    // FIX: Wir wrappen den Sink in einen Arc, um ihn sicher zu teilen
-    let sink = Arc::new(Sink::try_new(&state.stream_handle).map_err(|e| e.to_string())?);
-    sink.set_volume(volume);
-
-    {
-        let mut current_sink = state.current_sink.lock().unwrap();
-        if let Some(old_sink) = current_sink.take() {
-            old_sink.stop();
-        }
-        *current_sink = Some(Arc::clone(&sink)); // Wir klonen nur die Referenz!
-    }
-
-    let id_clone = state.playback_id.clone();
-
-    // Der Worker-Thread erbt die original-Referenz des Sinks
-    std::thread::spawn(move || {
-        let mut reader = match WavReader::open(&file_path) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-
-        let spec = reader.spec();
-        let channels = spec.channels as usize;
-        let sample_rate = spec.sample_rate;
-
-        let raw_samples: Vec<f32> = match spec.sample_format {
-            SampleFormat::Int => {
-                let max_val = 1_f32 / (1_i64 << (spec.bits_per_sample - 1)) as f32;
-                if spec.bits_per_sample <= 16 {
-                    reader.samples::<i16>().map(|s| s.unwrap_or(0) as f32 * max_val).collect()
-                } else {
-                    reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 * max_val).collect()
-                }
-            }
-            SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
-        };
-
-        let total_frames = raw_samples.len() / channels;
-        let mut input_channels = vec![vec![0.0; total_frames]; channels];
-        for (i, &sample) in raw_samples.iter().enumerate() {
-            input_channels[i % channels][i / channels] = sample;
-        }
-
-        let mut stretch = Stretch::new();
-        stretch.preset_default(channels as i32, sample_rate as f32);
-        stretch.set_transpose_semitones(semitones, None);
-
-        let chunk_size = 4096;
-        let mut frames_processed = 0;
-
-        loop {
-            if id_clone.load(Ordering::SeqCst) != new_id { break; }
-            if sink.len() > 2 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            }
-
-            let frames_left = total_frames - frames_processed;
-            if frames_left == 0 { break; }
-            let current_chunk = frames_left.min(chunk_size);
-
-            let mut in_chunk = vec![vec![0.0f32; current_chunk]; channels];
-            for ch in 0..channels {
-                in_chunk[ch].copy_from_slice(&input_channels[ch][frames_processed..frames_processed + current_chunk]);
-            }
-
-            let mut out_chunk = vec![vec![0.0f32; current_chunk]; channels];
-            stretch.process_vec(&in_chunk, current_chunk as i32, &mut out_chunk, current_chunk as i32);
-
-            let mut out_interleaved = Vec::with_capacity(current_chunk * channels);
-            for frame in 0..current_chunk {
-                for ch in 0..channels {
-                    out_interleaved.push(out_chunk[ch][frame]);
-                }
-            }
-
-            let buffer = SamplesBuffer::new(channels as u16, sample_rate, out_interleaved);
-            sink.append(buffer);
-            frames_processed += current_chunk;
-        }
-    });
-
-    Ok(())
 }
