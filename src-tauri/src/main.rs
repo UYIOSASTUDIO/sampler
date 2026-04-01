@@ -56,7 +56,18 @@ fn main() {
             commands::cleanup_database,
             commands::remove_folder,
             commands::get_connected_folders,
-            commands::reveal_in_finder
+            commands::reveal_in_finder,
+            commands::toggle_sample_like,
+            commands::get_collections,
+            commands::create_collection,
+            commands::add_to_collection,
+            commands::bulk_toggle_like,
+            commands::update_sample_metadata,
+            commands::get_user_tags,
+            commands::create_user_tag,
+            commands::delete_user_tag,
+            commands::get_all_available_tags,
+            commands::process_audio_pitch
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");

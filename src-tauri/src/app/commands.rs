@@ -1,8 +1,14 @@
 use crate::app::state::AppState;
 use crate::vault::scanner;
-use serde::Serialize;
-use sqlx::FromRow;
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, QueryBuilder, Sqlite};
 use tauri::State;
+use hound::{WavReader, WavWriter, WavSpec, SampleFormat};
+use ssstretch::Stretch;
+use sha2::{Sha256, Digest};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, FromRow)]
 pub struct SampleRecord {
@@ -13,13 +19,46 @@ pub struct SampleRecord {
     pub bpm: Option<f64>,
     pub key_signature: Option<String>,
     pub instrument_type: Option<String>,
+    pub tags: String,
     pub waveform_data: Option<Vec<u8>>,
+    pub is_liked: bool, // NEU
+}
+
+// ==========================================
+// FILTER STRUCTS
+// ==========================================
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BpmFilter {
+    pub is_range: bool,
+    pub exact: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterPayload {
+    pub instruments: Vec<String>,
+    pub genres: Vec<String>,
+    pub keys: Vec<String>,
+    pub formats: Vec<String>,
+    pub bpm: BpmFilter,
+    pub tag_match_mode: String,
+    pub only_liked: bool,
+    pub collection_id: Option<i64>, // NEU
+}
+#[derive(Debug, Serialize, FromRow)]
+pub struct TagResponse {
+    pub category: String,
+    pub value: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PaginatedResponse {
     pub samples: Vec<SampleRecord>,
     pub total_count: i64,
+    pub available_tags: Vec<TagResponse>,
 }
 
 // 1. SCAN: Speichert den Pfad und scannt
@@ -27,7 +66,7 @@ pub struct PaginatedResponse {
 pub async fn scan_library(
     path: String,
     state: State<'_, AppState>,
-    app_handle: tauri::AppHandle, // NEU: AppHandle injiziert
+    app_handle: tauri::AppHandle,
 ) -> Result<usize, String> {
     let pool = state.db.clone();
 
@@ -36,7 +75,6 @@ pub async fn scan_library(
         .execute(&pool)
         .await;
 
-    // AppHandle an den Scanner weitergeben
     scanner::scan_directory(path, pool, app_handle).await
 }
 
@@ -44,7 +82,7 @@ pub async fn scan_library(
 #[tauri::command]
 pub async fn rescan_all_folders(
     state: State<'_, AppState>,
-    app_handle: tauri::AppHandle, // NEU: AppHandle injiziert
+    app_handle: tauri::AppHandle,
 ) -> Result<usize, String> {
     let pool = state.db.clone();
     let mut total_added = 0;
@@ -55,7 +93,6 @@ pub async fn rescan_all_folders(
         .map_err(|e| e.to_string())?;
 
     for (path,) in folders {
-        // app_handle.clone(), damit wir ihn für jeden Ordner neu übergeben können
         if let Ok(count) = scanner::scan_directory(path, pool.clone(), app_handle.clone()).await {
             total_added += count;
         }
@@ -69,23 +106,106 @@ pub async fn rescan_all_folders(
 pub async fn get_connected_folders(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let pool = &state.db;
 
-    // Wir holen nur die Pfade, sortiert nach dem Hinzufüge-Datum
     let folders: Vec<(String,)> = sqlx::query_as("SELECT path FROM connected_folders ORDER BY added_at DESC")
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Wandle das SQL-Tuple in ein sauberes String-Array für Svelte um
     Ok(folders.into_iter().map(|(path,)| path).collect())
 }
 
-// 3. READ: Lädt die Samples für das UI (inkl. Full-Text Search)
+// ==========================================
+// DYNAMIC QUERY BUILDER HELPER
+// ==========================================
+fn build_where_clause<'args>(
+    builder: &mut QueryBuilder<'args, Sqlite>,
+    filters: &'args FilterPayload,
+    fts_match: &'args Option<String>,
+) {
+    #[allow(unused_assignments)]
+    let mut has_where = false;
+
+    macro_rules! push_and {
+        () => {
+            if has_where { builder.push(" AND "); }
+            else { builder.push(" WHERE "); has_where = true; }
+        }
+    }
+
+    // NEU: Favoriten-Filter zwingend anwenden, wenn aktiv
+    if filters.only_liked {
+        push_and!();
+        builder.push("s.is_liked = 1");
+    }
+
+    if let Some(ref s) = fts_match {
+        push_and!();
+        builder.push("fts.samples_fts MATCH ");
+        builder.push_bind(s);
+    }
+
+    let all_tags: Vec<&String> = filters.instruments.iter()
+        .chain(filters.genres.iter())
+        .chain(filters.formats.iter())
+        .collect();
+
+    if !all_tags.is_empty() {
+        if filters.tag_match_mode == "OR" {
+            push_and!();
+            builder.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_extract(value, '$.value') IN (");
+            let mut sep = builder.separated(", ");
+            // DER FIX: &t entpackt die Referenz, wodurch sie wieder lang genug lebt!
+            for &t in &all_tags { sep.push_bind(t); }
+            builder.push("))");
+        } else {
+            for &t in &all_tags {
+                push_and!();
+                builder.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_extract(value, '$.value') = ");
+                builder.push_bind(t);
+                builder.push(")");
+            }
+        }
+    }
+
+    // NEU: Intelligente Key-Logik (Erlaubt Suche nach "min" oder "maj" als Wildcard)
+    if !filters.keys.is_empty() {
+        push_and!();
+        builder.push("(");
+        let mut first = true;
+        for v in &filters.keys {
+            if !first { builder.push(" OR "); }
+            first = false;
+
+            if v == "min" || v == "maj" {
+                // Wildcard-Suche: Findet "C min", "F# min", etc.
+                builder.push("s.key_signature LIKE ");
+                builder.push_bind(format!("%{}", v));
+            } else {
+                // Exakte Suche: Findet exakt "C min" oder nur "C"
+                builder.push("s.key_signature = ");
+                builder.push_bind(v);
+            }
+        }
+        builder.push(")");
+    }
+
+    if filters.bpm.is_range {
+        if let Some(min) = filters.bpm.min { push_and!(); builder.push("s.bpm >= "); builder.push_bind(min); }
+        if let Some(max) = filters.bpm.max { push_and!(); builder.push("s.bpm <= "); builder.push_bind(max); }
+    } else if let Some(exact) = filters.bpm.exact {
+        push_and!(); builder.push("s.bpm = "); builder.push_bind(exact);
+    }
+}
+
+// 3. READ: Lädt die Samples und berechnet Facetten
 #[tauri::command]
 pub async fn get_samples(
-    filter_type: Option<String>,
     search_query: Option<String>,
     page: u32,
     page_size: u32,
+    filters: FilterPayload,
+    sort_field: String, // NEU: name, type, pack oder random
+    sort_order: String, // NEU: asc oder desc
     state: State<'_, AppState>
 ) -> Result<PaginatedResponse, String> {
     let pool = &state.db;
@@ -93,77 +213,90 @@ pub async fn get_samples(
     let limit = page_size as i64;
     let offset = ((page.max(1) - 1) * page_size) as i64;
 
+    // Wir bereiten die Suche so vor, dass sie nur Dateinamen und Tags scannt
     let fts_match = search_query
         .filter(|s| !s.trim().is_empty())
-        .map(|s| format!("\"{}\"*", s.replace("\"", "")));
+        .map(|s| {
+            let sanitized = s.replace("\"", "");
+            format!("filename:\"{sanitized}\"* OR tags:\"{sanitized}\"*")
+        });
 
-    let (samples, total_count) = match (filter_type, fts_match) {
-        (Some(f), Some(s)) => {
-            let count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM samples s
-                 INNER JOIN samples_fts fts ON s.id = fts.id
-                 WHERE fts.samples_fts MATCH ? AND s.instrument_type = ?"
-            )
-                .bind(&s).bind(&f).fetch_one(pool).await.map_err(|e| e.to_string())?;
+    // 1. TOTAL COUNT
+    let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM samples s ");
+    if fts_match.is_some() { count_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
 
-            let items = sqlx::query_as::<_, SampleRecord>(
-                "SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.waveform_data
-                 FROM samples s
-                 INNER JOIN samples_fts fts ON s.id = fts.id
-                 WHERE fts.samples_fts MATCH ? AND s.instrument_type = ?
-                 ORDER BY s.imported_at DESC LIMIT ? OFFSET ?"
-            )
-                .bind(&s).bind(&f).bind(limit).bind(offset).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    // DER FIX: Der Collection-Join MUSS auch hier beim Zählen rein!
+    if let Some(c_id) = filters.collection_id {
+        count_query.push("INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ");
+        count_query.push_bind(c_id);
+        count_query.push(" ");
+    }
 
-            (items, count.0)
-        },
-        (None, Some(s)) => {
-            let count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM samples s
-                 INNER JOIN samples_fts fts ON s.id = fts.id
-                 WHERE fts.samples_fts MATCH ?"
-            )
-                .bind(&s).fetch_one(pool).await.map_err(|e| e.to_string())?;
+    build_where_clause(&mut count_query, &filters, &fts_match);
+    let total_count: i64 = count_query.build_query_scalar().fetch_one(pool).await.unwrap_or(0);
 
-            let items = sqlx::query_as::<_, SampleRecord>(
-                "SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.waveform_data
-                 FROM samples s
-                 INNER JOIN samples_fts fts ON s.id = fts.id
-                 WHERE fts.samples_fts MATCH ?
-                 ORDER BY s.imported_at DESC LIMIT ? OFFSET ?"
-            )
-                .bind(&s).bind(limit).bind(offset).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    // 2. DYNAMISCHE SAMPLES
+    let mut samples_query = QueryBuilder::new("SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.tags, s.waveform_data, s.is_liked FROM samples s ");
 
-            (items, count.0)
-        },
-        (Some(f), None) => {
-            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM samples WHERE instrument_type = ?")
-                .bind(&f).fetch_one(pool).await.map_err(|e| e.to_string())?;
+    if fts_match.is_some() { samples_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
 
-            let items = sqlx::query_as::<_, SampleRecord>(
-                "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type, waveform_data
-                 FROM samples WHERE instrument_type = ?
-                 ORDER BY imported_at DESC LIMIT ? OFFSET ?"
-            )
-                .bind(&f).bind(limit).bind(offset).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    // NEU: Wenn eine Collection gefiltert wird, joine die relationale Tabelle
+    if let Some(c_id) = filters.collection_id {
+        samples_query.push("INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ");
+        samples_query.push_bind(c_id);
+        samples_query.push(" ");
+    }
 
-            (items, count.0)
-        },
-        (None, None) => {
-            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM samples")
-                .fetch_one(pool).await.map_err(|e| e.to_string())?;
+    build_where_clause(&mut samples_query, &filters, &fts_match);
 
-            let items = sqlx::query_as::<_, SampleRecord>(
-                "SELECT id, filename, original_path, duration_ms, bpm, key_signature, instrument_type, waveform_data
-                 FROM samples ORDER BY imported_at DESC LIMIT ? OFFSET ?"
-            )
-                .bind(limit).bind(offset).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    // NEU: Dynamische ORDER BY Klausel
+    match sort_field.as_str() {
+        "name" => { samples_query.push(" ORDER BY s.filename "); }
+        "type" => { samples_query.push(" ORDER BY s.instrument_type "); }
+        "pack" => { samples_query.push(" ORDER BY s.original_path "); }
+        "random" => { samples_query.push(" ORDER BY RANDOM() "); }
+        _ => { samples_query.push(" ORDER BY s.filename "); }
+    }
 
-            (items, count.0)
+    // Random hat kein ASC/DESC, alles andere schon
+    if sort_field != "random" {
+        if sort_order == "desc" {
+            samples_query.push(" DESC LIMIT ");
+        } else {
+            samples_query.push(" ASC LIMIT ");
         }
-    };
+    } else {
+        samples_query.push(" LIMIT ");
+    }
 
-    Ok(PaginatedResponse { samples, total_count })
+    samples_query.push_bind(limit);
+    samples_query.push(" OFFSET ");
+    samples_query.push_bind(offset);
+
+    let samples = samples_query.build_query_as::<SampleRecord>().fetch_all(pool).await.map_err(|e| e.to_string())?;
+
+    // 3. DYNAMISCHE FACETTEN-SUCHE
+    let mut tags_query = QueryBuilder::new("SELECT DISTINCT json_extract(value, '$.category') as category, json_extract(value, '$.value') as value FROM samples s ");
+    if fts_match.is_some() { tags_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
+    tags_query.push(", json_each(s.tags) ");
+    build_where_clause(&mut tags_query, &filters, &fts_match);
+
+    let mut tags_vec = tags_query.build_query_as::<TagResponse>().fetch_all(pool).await.unwrap_or_default();
+
+    tags_vec.sort_by(|a, b| {
+        let prio = |cat: &str, val: &str| -> i32 {
+            if cat == val { return 1; }
+            match cat {
+                "Drums" | "Percussion" | "Bass" | "Synth" | "Keys" | "Guitar" | "Strings" | "Vocals" | "Brass and Woodwinds" | "FX" => 2,
+                "Format" => 3, "Genre" => 4, "Character" => 5, _ => 6,
+            }
+        };
+        prio(&a.category, &a.value).cmp(&prio(&b.category, &b.value))
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+
+    Ok(PaginatedResponse { samples, total_count, available_tags: tags_vec })
 }
 
 // 4. CLEAR: Löscht die gesamte Library
@@ -187,14 +320,12 @@ pub async fn remove_folder(path: String, state: State<'_, AppState>) -> Result<u
     let pool = &state.db;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-    // 1. Ordner aus der History entfernen
     sqlx::query("DELETE FROM connected_folders WHERE path = ?")
         .bind(&path)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
-    // 2. Alle Samples löschen, deren Pfad mit diesem Ordnerpfad beginnt
     let like_path = format!("{}%", path);
     let result = sqlx::query("DELETE FROM samples WHERE original_path LIKE ?")
         .bind(&like_path)
@@ -213,7 +344,6 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
     let pool = &state.db;
     let mut removed = 0;
 
-    // Phase 1: Welche Hauptordner sind aktuell physisch erreichbar (online)?
     let folders: Vec<(String,)> = sqlx::query_as("SELECT path FROM connected_folders")
         .fetch_all(pool).await.map_err(|e| e.to_string())?;
 
@@ -224,17 +354,14 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
         }
     }
 
-    // Wenn gar kein Ordner erreichbar ist, brechen wir direkt sicher ab
     if online_folders.is_empty() {
         return Ok(0);
     }
 
-    // Phase 2: Prüfen der Einzeldateien
     let records: Vec<(String, String)> = sqlx::query_as("SELECT id, original_path FROM samples")
         .fetch_all(pool).await.map_err(|e| e.to_string())?;
 
     for (id, path) in records {
-        // Wir löschen nur Dateileichen, wenn ihr übergeordneter Hauptordner gerade ONLINE ist
         let is_parent_online = online_folders.iter().any(|f| path.starts_with(f));
 
         if is_parent_online {
@@ -256,4 +383,292 @@ pub fn reveal_in_finder(path: String) {
 
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("explorer").arg(format!("/select,\"{}\"", path)).spawn();
+}
+
+// 9. TOGGLE LIKE: Ändert den Favoriten-Status in der Datenbank
+#[tauri::command]
+pub async fn toggle_sample_like(id: String, is_liked: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let pool = &state.db;
+
+    sqlx::query("UPDATE samples SET is_liked = ? WHERE id = ?")
+        .bind(is_liked)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)] // FIX: sqlx::FromRow hinzugefügt!
+#[serde(rename_all = "camelCase")]
+pub struct CollectionRecord {
+    pub id: i64,
+    pub name: String,
+}
+
+#[tauri::command]
+pub async fn get_collections(state: State<'_, AppState>) -> Result<Vec<CollectionRecord>, String> {
+    // FIX: query_as::<_, CollectionRecord> (ohne Ausrufezeichen) überspringt den Compile-Time Check!
+    sqlx::query_as::<_, CollectionRecord>("SELECT id, name FROM collections ORDER BY name ASC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_collection(name: String, state: State<'_, AppState>) -> Result<i64, String> {
+    let result = sqlx::query("INSERT INTO collections (name) VALUES (?)")
+        .bind(name).execute(&state.db).await.map_err(|e| e.to_string())?;
+    Ok(result.last_insert_rowid())
+}
+
+#[tauri::command]
+pub async fn add_to_collection(collection_id: i64, sample_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let mut builder = QueryBuilder::new("INSERT OR IGNORE INTO collection_samples (collection_id, sample_id) ");
+    builder.push_values(sample_ids, |mut b, id| {
+        b.push_bind(collection_id).push_bind(id);
+    });
+    builder.build().execute(&state.db).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn bulk_toggle_like(sample_ids: Vec<String>, is_liked: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut builder = QueryBuilder::new("UPDATE samples SET is_liked = ");
+    builder.push_bind(is_liked);
+    builder.push(" WHERE id IN (");
+    let mut sep = builder.separated(", ");
+    for id in sample_ids { sep.push_bind(id); }
+    builder.push(")");
+    builder.build().execute(&state.db).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMetadataPayload {
+    pub id: String,
+    pub filename: String,
+    pub bpm: Option<f64>,
+    pub key_signature: Option<String>,
+    pub tags: String,
+}
+
+#[tauri::command]
+pub async fn update_sample_metadata(payload: UpdateMetadataPayload, state: State<'_, AppState>) -> Result<(), String> {
+    sqlx::query("UPDATE samples SET filename = ?, bpm = ?, key_signature = ?, tags = ? WHERE id = ?")
+        .bind(payload.filename)
+        .bind(payload.bpm)
+        .bind(payload.key_signature)
+        .bind(payload.tags)
+        .bind(payload.id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct TagRecord {
+    pub category: String,
+    pub value: String,
+}
+
+#[tauri::command]
+pub async fn get_user_tags(state: State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
+    sqlx::query_as::<_, TagRecord>("SELECT category, value FROM user_tags ORDER BY value ASC")
+        .fetch_all(&state.db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_user_tag(category: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    sqlx::query("INSERT OR IGNORE INTO user_tags (category, value) VALUES (?, ?)")
+        .bind(category).bind(value).execute(&state.db).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Result<(), String> {
+    // 1. Den Tag global aus der user_tags Tabelle entfernen
+    sqlx::query("DELETE FROM user_tags WHERE value = ?")
+        .bind(&value).execute(&state.db).await.map_err(|e| e.to_string())?;
+
+    // Wir brauchen ein temporäres Struct, um die betroffenen Samples zu laden
+    #[derive(sqlx::FromRow)]
+    struct SampleTagRow {
+        id: String,
+        tags: String,
+    }
+
+    // 2. Suche alle Samples, die diesen Tag aktuell verwenden
+    let pattern = format!("%\"value\":\"{}\"%", value);
+    let samples = sqlx::query_as::<_, SampleTagRow>("SELECT id, tags FROM samples WHERE tags LIKE ?")
+        .bind(pattern)
+        .fetch_all(&state.db).await.map_err(|e| e.to_string())?;
+
+    // 3. Cascade Delete: Den Tag aus der JSON jedes Samples entfernen
+    for sample in samples {
+        if let Ok(mut parsed_tags) = serde_json::from_str::<Vec<serde_json::Value>>(&sample.tags) {
+
+            // Filtere das Array: Behalte alles, ABER NICHT den gelöschten Tag
+            parsed_tags.retain(|t| {
+                t.get("value").and_then(|v| v.as_str()) != Some(&value)
+            });
+
+            // Speichere die gesäuberte JSON zurück in die Datenbank
+            if let Ok(new_tags_string) = serde_json::to_string(&parsed_tags) {
+                sqlx::query("UPDATE samples SET tags = ? WHERE id = ?")
+                    .bind(new_tags_string)
+                    .bind(sample.id)
+                    .execute(&state.db).await.ok(); // .ok() ignoriert einzelne Fehler, damit der Loop weiterläuft
+            }
+        }
+    }
+
+    Ok(())
+}
+
+use crate::vault::taxonomy::TaxonomyEngine;
+
+#[tauri::command]
+pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
+    let mut all_tags = Vec::new();
+
+    // 1. Hole die festen System-Tags aus der Taxonomy Engine
+    let taxonomy = TaxonomyEngine::new();
+    for rule in taxonomy.rules {
+        // Vermeide Duplikate im UI (z.B. weil "hat" und "hihat" beide zum Tag "Hi-Hat" führen)
+        if !all_tags.iter().any(|t: &TagRecord| t.value == rule.value && t.category == rule.category) {
+            all_tags.push(TagRecord {
+                category: rule.category.to_string(),
+                value: rule.value.to_string(),
+            });
+        }
+    }
+
+    // 2. Hole die flexiblen User-Tags aus der Datenbank
+    let user_tags = sqlx::query_as::<_, TagRecord>("SELECT category, value FROM user_tags ORDER BY value ASC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 3. Füge beide Listen zusammen
+    all_tags.extend(user_tags);
+
+    Ok(all_tags)
+}
+
+#[tauri::command]
+pub async fn process_audio_pitch(
+    file_path: String,
+    semitones: f32,
+    _state: State<'_, AppState>,
+) -> Result<String, String> {
+    // 1. Wenn semitones 0 ist, müssen wir nicht rechnen. Original zurückgeben!
+    if semitones == 0.0 {
+        return Ok(file_path);
+    }
+
+    // 2. Intelligentes Caching (Damit wir nicht 2x das gleiche Sample pitchen)
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}_{}", file_path, semitones).as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+
+    let temp_dir = env::temp_dir().join("samplevault_cache");
+    if !temp_dir.exists() {
+        fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    }
+
+    let cached_file_path = temp_dir.join(format!("{}.wav", hash));
+    let cached_str = cached_file_path.to_string_lossy().to_string();
+
+    // Latenzfreier Return, wenn wir das Sample schon mal berechnet haben
+    if cached_file_path.exists() {
+        return Ok(cached_str);
+    }
+
+    // 3. DSP ENGINE (In einem Background-Thread, damit Svelte nicht einfriert!)
+    let input_path = file_path.clone();
+    let output_path = cached_file_path.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // A) Datei öffnen & Metadaten lesen
+        let mut reader = WavReader::open(&input_path).map_err(|e| e.to_string())?;
+        let spec = reader.spec();
+        let channels = spec.channels as usize;
+        let sample_rate = spec.sample_rate as f32;
+
+        // B) Audio absolut verlustfrei in 32-Bit Gleitkomma-Zahlen (f32) auslesen
+        let samples: Vec<f32> = match spec.sample_format {
+            SampleFormat::Int => {
+                let max_val = 1_f32 / (1_i64 << (spec.bits_per_sample - 1)) as f32;
+                if spec.bits_per_sample <= 16 {
+                    reader.samples::<i16>().map(|s| s.unwrap_or(0) as f32 * max_val).collect()
+                } else {
+                    reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 * max_val).collect()
+                }
+            }
+            SampleFormat::Float => {
+                reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
+            }
+        };
+
+        let input_len = samples.len() / channels;
+
+        // C) De-Interleaving: Aus [Links, Rechts, Links, Rechts] wird [[Links], [Rechts]]
+        let mut input_channels = vec![vec![0.0; input_len]; channels];
+        for (i, &sample) in samples.iter().enumerate() {
+            let ch = i % channels;
+            let frame = i / channels;
+            input_channels[ch][frame] = sample;
+        }
+
+        // D) SIGNALSMITH STRETCH ENGINE KONFIGURIEREN
+        let mut stretch = Stretch::new();
+        stretch.preset_default(channels as i32, sample_rate);
+
+        // Den Pitch ohne Tempo-Verlust setzen
+        stretch.set_transpose_semitones(semitones, None);
+
+        let mut output_channels = vec![vec![0.0f32; input_len]; channels];
+
+        // E) AUDIO PROZESSIEREN
+        stretch.process_vec(
+            &input_channels,
+            input_len as i32,
+            &mut output_channels,
+            input_len as i32 // Output = Input, da sich das Tempo nicht ändert!
+        );
+
+        // F) Re-Interleaving (Spuren für das WAV-Format wieder zusammenführen)
+        let mut out_interleaved = Vec::with_capacity(input_len * channels);
+        for frame in 0..input_len {
+            for ch in 0..channels {
+                out_interleaved.push(output_channels[ch][frame]);
+            }
+        }
+
+        // G) Fertiges Audio in die unsichtbare Cache-Datei schreiben (als 32-bit Float)
+        let out_spec = WavSpec {
+            channels: channels as u16,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(&output_path, out_spec).map_err(|e| e.to_string())?;
+        for sample in out_interleaved {
+            writer.write_sample(sample).map_err(|e| e.to_string())?;
+        }
+        writer.finalize().map_err(|e| e.to_string())?;
+
+        Ok::<(), String>(())
+    })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    // Gib den Pfad der neuen, gepitchten Datei an Svelte zurück
+    Ok(cached_str)
 }

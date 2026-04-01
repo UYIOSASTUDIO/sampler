@@ -8,7 +8,7 @@ use futures::stream::{self, StreamExt};
 use walkdir::WalkDir;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter}; // Für das Event-Streaming
-use crate::audio::{analyzer, classify, waveform};
+use crate::audio::{analyzer, classify, waveform, metadata_parser};
 use crate::vault::taxonomy;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["wav", "mp3", "aiff", "flac", "ogg", "m4a"];
@@ -43,6 +43,8 @@ struct CpuAnalysisResult {
     sample_rate: i64,
     channels: i64,
     bit_depth: i64,
+    bpm: Option<f64>,        // NEU
+    key_signature: Option<String>, // NEU
     instrument_type: Option<String>,
     waveform_data: Vec<u8>,
     tags_json: String,
@@ -65,8 +67,6 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
     }
     let file_hash = format!("{:x}", hasher.finalize());
 
-    let instrument_type = classify::classify_by_filename(&filename);
-
     let waveform_data = waveform::extract_waveform(path, 40).unwrap_or_else(|_| {
         vec![10; 40]
     });
@@ -76,19 +76,28 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
         Err(_) => (0, 44100, 2, 16)
     };
 
-    // NEU: Hochperformante Taxonomie-Analyse
+    // 1. ZUERST Taxonomie-Analyse (Erkennt One-Shot vs Loop)
     let engine = taxonomy::TaxonomyEngine::global();
     let tags_array = engine.analyze(path, duration_ms);
     let tags_json = serde_json::to_string(&tags_array).unwrap_or_else(|_| "[]".to_string());
 
-    // Fallback für die alte Spalte (bis das Frontend umgebaut ist)
+    // 2. Format auswerten
+    let is_loop = tags_array.iter().any(|t| t["category"] == "Format" && t["value"] == "Loop");
+
+    // 3. DANACH Dateinamen parsen (und das Wissen über das Format übergeben!)
+    let parsed_meta = metadata_parser::parse_filename(&filename, is_loop);
+
+    // Fallback für die alte Spalte
     let instrument_type = tags_array.iter()
         .find(|t| t["category"] == "Drums" || t["category"] == "Synth" || t["category"] == "Bass")
         .map(|t| t["value"].as_str().unwrap_or("").to_string());
 
     Ok(CpuAnalysisResult {
         original_path, filename, extension, file_hash, file_size,
-        duration_ms, sample_rate, channels, bit_depth, instrument_type,
+        duration_ms, sample_rate, channels, bit_depth,
+        bpm: parsed_meta.bpm,
+        key_signature: parsed_meta.key,
+        instrument_type,
         waveform_data, tags_json
     })
 }
@@ -149,8 +158,8 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
                     r#"
                     INSERT OR IGNORE INTO samples (
                         id, file_hash, original_path, filename, extension, file_size,
-                        duration_ms, sample_rate, channels, bit_depth, instrument_type, tags, waveform_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
                 )
                     .bind(id)
@@ -163,6 +172,8 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
                     .bind(analysis.sample_rate)
                     .bind(analysis.channels)
                     .bind(analysis.bit_depth)
+                    .bind(analysis.bpm)              // NEU
+                    .bind(&analysis.key_signature)   // NEU
                     .bind(&analysis.instrument_type)
                     .bind(&analysis.tags_json)
                     .bind(&analysis.waveform_data)
@@ -203,8 +214,8 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             r#"
                     INSERT OR IGNORE INTO samples (
                         id, file_hash, original_path, filename, extension, file_size,
-                        duration_ms, sample_rate, channels, bit_depth, instrument_type, tags, waveform_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
         )
             .bind(id)
@@ -217,6 +228,8 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             .bind(analysis.sample_rate)
             .bind(analysis.channels)
             .bind(analysis.bit_depth)
+            .bind(analysis.bpm)              // NEU
+            .bind(&analysis.key_signature)   // NEU
             .bind(&analysis.instrument_type)
             .bind(&analysis.tags_json)
             .bind(&analysis.waveform_data)

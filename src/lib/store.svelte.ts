@@ -1,17 +1,44 @@
 export const appState = $state({
-    currentView: 'sounds' as 'sounds' | 'projects' | 'editor',
-    isSettingsOpen: false,
+    // NEU: 'settings' als View hinzugefügt
+    currentView: 'sounds' as 'sounds' | 'projects' | 'editor' | 'settings',
+
+    // NEU: Der aktive Tab für die Sidebar
+    activeSettingsTab: 'general' as 'general' | 'library' | 'audio',
+
+    activeSoundsTab: 'samples' as 'samples' | 'collections',
+
+    globalKey: null as string | null,
+
+    isCreateCollectionModalOpen: false,
     themePreference: 'system' as 'light' | 'dark' | 'system',
     isDarkMode: true,
 
-    // --- GLOBAL AUDIO STATE ---
+    globalSearchQuery: '',
+    selectedSampleIds: [] as string[], // Hält alle Checkbox-IDs
+    collections: [] as {id: number, name: string}[], // Hält die Ordner-Liste
+
     currentSample: null as any,
     isPlaying: false,
     playbackProgress: 0,
-    globalVolume: 0.8, // Standardlautstärke 80%
+    globalVolume: 0.8,
 
-    // --- IPC COMMANDS (Footer -> Page) ---
     cmdTogglePlay: 0,
     cmdNext: 0,
     cmdPrev: 0,
+
+    filters: {
+        instruments: [] as string[],
+        genres: [] as string[],
+        keys: [] as string[],
+        formats: [] as string[],
+        bpm: {
+            isRange: false,
+            exact: null as number | null,
+            min: null as number | null,
+            max: null as number | null
+        },
+        tagMatchMode: 'AND' as 'AND' | 'OR', // NEU: 'AND' = Both, 'OR' = Either
+        onlyLiked: false,
+        collectionId: null as number | null
+    }
 });

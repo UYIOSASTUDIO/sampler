@@ -60,17 +60,37 @@
         };
     }
 
-    onMount(() => {
+    onMount(async() => {
         const savedTheme = localStorage.getItem('samplevault-theme') as 'light' | 'dark' | 'system' | null;
         if (savedTheme) {
             appState.themePreference = savedTheme;
         }
-
         systemMedia = window.matchMedia('(prefers-color-scheme: dark)');
         systemMedia.addEventListener('change', applyTheme);
 
         applyTheme();
+        await loadCollections();
     });
+
+    async function loadCollections() {
+        try {
+            appState.collections = await invoke('get_collections');
+        } catch (e) { console.error(e); }
+    }
+
+    let newCollectionName = $state('');
+
+    async function submitCollection() {
+        if (!newCollectionName || newCollectionName.trim() === '') return;
+        try {
+            await invoke('create_collection', { name: newCollectionName.trim() });
+            await loadCollections();
+            appState.isCreateCollectionModalOpen = false;
+            newCollectionName = '';
+        } catch (e) {
+            alert("Error: Name might already exist.");
+        }
+    }
 
     $effect(() => {
         if (appState.themePreference) {
@@ -96,6 +116,38 @@
         appState.themePreference = appState.isDarkMode ? 'light' : 'dark';
         localStorage.setItem('samplevault-theme', appState.themePreference);
     }
+
+    // --- SIDEBAR NAVIGATION ---
+
+    // 1. Zurück zur globalen Haupt-Bibliothek
+    function switchToMainLibrary() {
+        if (appState.currentView === 'sounds' && !appState.filters.onlyLiked && appState.filters.collectionId === null) return;
+        appState.currentView = 'sounds';
+        appState.activeSoundsTab = 'samples'; // NEU
+        appState.filters.onlyLiked = false;
+        appState.filters.collectionId = null;
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('trigger-sample-reload'));
+    }
+
+    // 2. Zum Liked-Ordner wechseln
+    function switchToLiked(enabled: boolean) {
+        if (appState.filters.onlyLiked === enabled && appState.currentView === 'sounds' && appState.filters.collectionId === null) return;
+        appState.currentView = 'sounds';
+        appState.activeSoundsTab = 'collections'; // NEU (Liked gehört konzeptionell zu Collections)
+        appState.filters.onlyLiked = enabled;
+        appState.filters.collectionId = null;
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('trigger-sample-reload'));
+    }
+
+    // 3. Zu einer Collection wechseln
+    function switchToCollection(id: number | null) {
+        if (appState.filters.collectionId === id && appState.currentView === 'sounds') return;
+        appState.currentView = 'sounds';
+        appState.activeSoundsTab = 'collections'; // NEU
+        appState.filters.collectionId = id;
+        appState.filters.onlyLiked = false;
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('trigger-sample-reload'));
+    }
 </script>
 
 <div class="absolute inset-0 flex flex-col overflow-hidden bg-white text-zinc-900 dark:bg-[#121212] dark:text-zinc-100 font-sans antialiased" style="will-change: transform, width, height;">
@@ -111,9 +163,13 @@
             <nav class="flex-1 overflow-y-auto px-3 py-4 space-y-6">
                 {#if appState.currentView === 'sounds'}
                     <div class="space-y-1">
-                        <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium bg-zinc-200/50 dark:bg-zinc-800/50 text-zinc-900 dark:text-zinc-50 transition-colors cursor-pointer">
+                        <button
+                                onclick={switchToMainLibrary}
+                                class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {!appState.filters.onlyLiked && appState.filters.collectionId === null ? 'bg-zinc-200/50 dark:bg-zinc-800/50 text-zinc-900 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}"
+                        >
                             <Library size={18} /> Sounds
                         </button>
+
                         <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100 transition-colors cursor-pointer">
                             <Compass size={18} /> Discover
                         </button>
@@ -122,20 +178,26 @@
                     <div>
                         <div class="mb-2 flex items-center justify-between px-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">
                             <span>Collections</span>
-                            <button class="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer">
+                            <button onclick={() => appState.isCreateCollectionModalOpen = true} class="hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer">
                                 <Plus size={14} />
                             </button>
                         </div>
                         <div class="space-y-1">
-                            <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100 transition-colors cursor-pointer">
-                                <Heart size={18} /> Likes
+                            <button
+                                    onclick={() => { appState.filters.collectionId = null; switchToLiked(true); }}
+                                    class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.filters.onlyLiked ? 'bg-zinc-200/50 dark:bg-zinc-800/50 text-zinc-900 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}"
+                            >
+                                <Heart size={18} class={appState.filters.onlyLiked ? 'fill-red-500 text-red-500' : ''} /> Likes
                             </button>
-                            <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100 transition-colors cursor-pointer">
-                                <Folder size={18} /> Cinematic FX
-                            </button>
-                            <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100 transition-colors cursor-pointer">
-                                <Folder size={18} /> Drums
-                            </button>
+
+                            {#each appState.collections as collection}
+                                <button
+                                        onclick={() => switchToCollection(collection.id)}
+                                        class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.filters.collectionId === collection.id ? 'bg-zinc-200/50 dark:bg-zinc-800/50 text-zinc-900 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}"
+                                >
+                                    <Folder size={18} class={appState.filters.collectionId === collection.id ? 'fill-zinc-900 dark:fill-zinc-100' : ''} /> {collection.name}
+                                </button>
+                            {/each}
                         </div>
                     </div>
 
@@ -146,6 +208,20 @@
                 {:else if appState.currentView === 'editor'}
                     <div class="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Batch Renamer</div>
                     <div class="px-3 text-sm text-zinc-400 italic">Metadata inputs will appear here...</div>
+
+                {:else if appState.currentView === 'settings'}
+                    <div class="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Preferences</div>
+                    <div class="space-y-1">
+                        <button onclick={() => appState.activeSettingsTab = 'general'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'general' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
+                            General
+                        </button>
+                        <button onclick={() => appState.activeSettingsTab = 'library'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'library' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
+                            Library
+                        </button>
+                        <button onclick={() => appState.activeSettingsTab = 'audio'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'audio' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
+                            Audio
+                        </button>
+                    </div>
                 {/if}
             </nav>
         </aside>
@@ -156,7 +232,13 @@
 
                 <div class="flex flex-1 items-center relative">
                     <Search size={16} class="absolute left-3 text-zinc-400" />
-                    <input data-tauri-drag-region="false" type="text" placeholder={appState.currentView === 'sounds' ? "Search your library..." : "Search..."} class="h-9 w-full max-w-sm rounded-md border border-zinc-200 bg-zinc-50 pl-9 pr-4 text-sm outline-none focus:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 transition-colors">
+                    <input
+                            data-tauri-drag-region="false"
+                            type="text"
+                            bind:value={appState.globalSearchQuery}
+                            placeholder={appState.currentView === 'sounds' ? "Search your library..." : appState.currentView === 'projects' ? "Search projects..." : "Search..."}
+                            class="h-9 w-full max-w-sm rounded-md border border-zinc-200 bg-zinc-50 pl-9 pr-4 text-sm outline-none focus:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 transition-colors"
+                    >
                 </div>
 
                 <div class="flex items-center gap-6">
@@ -172,7 +254,11 @@
                         <button onclick={toggleTheme} class="text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors cursor-pointer" title="Toggle Theme">
                             {#if appState.isDarkMode} <Sun size={18} /> {:else} <Moon size={18} /> {/if}
                         </button>
-                        <button onclick={() => appState.isSettingsOpen = true} class="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer" title="Preferences">
+                        <button
+                                onclick={() => appState.currentView = appState.currentView === 'settings' ? 'sounds' : 'settings'}
+                                class="transition-colors cursor-pointer {appState.currentView === 'settings' ? 'text-zinc-900 dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'}"
+                                title="Preferences"
+                        >
                             <Settings size={18} />
                         </button>
                     </div>
@@ -234,3 +320,23 @@
         </div>
     </footer>
 </div>
+
+{#if appState.isCreateCollectionModalOpen}
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+        <div class="w-full max-w-sm overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] p-5">
+            <h2 class="text-lg font-bold text-zinc-900 dark:text-zinc-100 mb-4">New Collection</h2>
+            <input
+                    type="text"
+                    bind:value={newCollectionName}
+                    placeholder="Collection Name"
+                    class="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 mb-5"
+                    autofocus
+                    onkeydown={(e) => { if (e.key === 'Enter') submitCollection(); }}
+            >
+            <div class="flex justify-end gap-3">
+                <button onclick={() => { appState.isCreateCollectionModalOpen = false; newCollectionName = ''; }} class="px-4 py-2 text-sm font-semibold text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 cursor-pointer">Cancel</button>
+                <button onclick={submitCollection} class="rounded-md bg-zinc-900 px-4 py-2 text-sm font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white cursor-pointer">Create</button>
+            </div>
+        </div>
+    </div>
+{/if}

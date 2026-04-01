@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS samples (
                                        key_confidence REAL,
                                        instrument_type TEXT,
                                        type_confidence REAL,
+                                       is_liked BOOLEAN NOT NULL DEFAULT 0,
 
     -- NEU FÜR DIE TAXONOMIE ENGINE:
                                        tags TEXT NOT NULL DEFAULT '[]',
@@ -33,6 +34,25 @@ CREATE TABLE IF NOT EXISTS samples (
                                        play_count INTEGER NOT NULL DEFAULT 0,
                                        imported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                                        last_played_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS collections (
+                                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                           name TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collection_samples (
+                                                  collection_id INTEGER,
+                                                  sample_id TEXT,
+                                                  PRIMARY KEY (collection_id, sample_id),
+    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+    FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE
+    );
+
+CREATE TABLE IF NOT EXISTS user_tags (
+                                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                         category TEXT NOT NULL,
+                                         value TEXT UNIQUE NOT NULL
 );
 
 -- 2. B-TREE INDIZES
