@@ -73,14 +73,9 @@
         return pages;
     });
 
-    // --- ZERO-LATENCY WEB AUDIO API & RAM CACHE ---
-    let audioCtx: AudioContext;
-    let gainNode: GainNode;
-    let sourceNode: AudioBufferSourceNode | null = null;
+    // --- AUDIO STATE (Refactored to Rust Backend) ---
     let playingId: string | null = $state(null);
     let selectedId: string | null = $state(null);
-
-    const audioRamCache = new Map<string, AudioBuffer>();
 
     let playbackProgress: number = $state(0);
     let currentSampleDuration: number = 0;
@@ -112,15 +107,20 @@
     let scanPercentage = $derived(scanTotal > 0 ? Math.round((scanCurrent / scanTotal) * 100) : 0);
 
     function updateProgress() {
-        if (playingId && currentSampleDuration > 0 && audioCtx) {
-            const elapsed = audioCtx.currentTime - playbackStartTime;
-            const progress = Math.min(elapsed / currentSampleDuration, 1.0);
-            playbackProgress = progress;
-            appState.playbackProgress = progress;
+        if (appState.isPlaying && currentSampleDuration > 0) {
+            const elapsed = (performance.now() - playbackStartTime) / 1000;
+            let progress = elapsed / currentSampleDuration;
 
             if (progress >= 1.0) {
+                appState.playbackProgress = 1.0;
+                playbackProgress = 1.0;
+                appState.isPlaying = false;
+                playingId = null;
                 cancelAnimationFrame(animationFrameId);
+                setTimeout(() => { if (!appState.isPlaying) appState.playbackProgress = 0; }, 150);
             } else {
+                appState.playbackProgress = progress;
+                playbackProgress = progress;
                 animationFrameId = requestAnimationFrame(updateProgress);
             }
         }
@@ -153,11 +153,6 @@
     onMount(async () => {
         // @ts-ignore
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        audioCtx = new AudioContextClass();
-
-        gainNode = audioCtx.createGain();
-        gainNode.connect(audioCtx.destination);
-        gainNode.gain.value = appState.globalVolume;
 
         window.addEventListener('keydown', handleKeydown);
         window.addEventListener('click', handleGlobalClick);
@@ -177,8 +172,6 @@
     });
 
     onDestroy(() => {
-        if (sourceNode) sourceNode.stop();
-        if (audioCtx) audioCtx.close();
         cancelAnimationFrame(animationFrameId);
 
         window.removeEventListener('keydown', handleKeydown);
@@ -187,7 +180,7 @@
     });
 
     $effect(() => {
-        if (gainNode) gainNode.gain.value = appState.globalVolume;
+        invoke('set_audio_volume', { volume: appState.globalVolume });
     });
 
     async function createNewTag() {
@@ -425,70 +418,40 @@
         selectedId = sample.id;
 
         if (playingId === sample.id && !forceRestart) {
-            if (sourceNode) { sourceNode.onended = null; sourceNode.stop(); }
-            playingId = null; appState.isPlaying = false; appState.playbackProgress = 0; cancelAnimationFrame(animationFrameId);
+            await invoke('stop_audio');
+            playingId = null;
+            appState.isPlaying = false;
+            appState.playbackProgress = 0;
+            cancelAnimationFrame(animationFrameId);
             return;
         }
 
-        if (sourceNode) { sourceNode.onended = null; try { sourceNode.stop(); } catch(e) {} }
         cancelAnimationFrame(animationFrameId);
-
         playingId = sample.id;
         appState.playbackProgress = 0;
+        appState.currentSample = sample;
 
-        // 1. Berechne den nötigen Shift
         let semitones = 0;
         if (appState.globalKey && sample.key_signature) {
             semitones = getSemitoneShift(sample.key_signature, appState.globalKey);
         }
 
-        // 2. Erzeuge den Cache-Key inklusive Pitch! (Sonst lädt Svelte immer das alte Original aus dem RAM)
-        const cacheKey = `${sample.id}_${semitones}`;
-        let audioBuffer = audioRamCache.get(cacheKey);
+        currentSampleDuration = sample.duration_ms / 1000; // Umrechnung in Sekunden
 
-        if (!audioBuffer) {
-            try {
-                // 3. Rust um den (gepitchten) Dateipfad bitten
-                const pathToLoad = await invoke<string>('process_audio_pitch', {
-                    filePath: sample.original_path,
-                    semitones: semitones
-                });
+        try {
+            await invoke('play_audio', {
+                filePath: sample.original_path,
+                semitones: semitones,
+                volume: appState.globalVolume
+            });
 
-                // 4. Pfad laden (entweder das Original oder die unsichtbare Cache-Datei von Rust)
-                const assetUrl = convertFileSrc(pathToLoad);
-                const response = await fetch(assetUrl);
-                audioBuffer = await audioCtx.decodeAudioData(await response.arrayBuffer());
-
-                if (audioRamCache.size >= 200) { const firstKey = audioRamCache.keys().next().value; if (firstKey) audioRamCache.delete(firstKey); }
-                audioRamCache.set(cacheKey, audioBuffer);
-            } catch (error) { console.error(error); playingId = null; return; }
+            appState.isPlaying = true;
+            playbackStartTime = performance.now();
+            animationFrameId = requestAnimationFrame(updateProgress);
+        } catch (error) {
+            console.error(error);
+            playingId = null;
         }
-
-        if (playingId !== sample.id) return;
-
-        appState.currentSample = sample;
-        appState.isPlaying = true;
-
-        sourceNode = audioCtx.createBufferSource();
-        sourceNode.buffer = audioBuffer;
-        sourceNode.connect(gainNode);
-
-        sourceNode.onended = () => {
-            if (playingId === sample.id) {
-                appState.playbackProgress = 1.0;
-                playingId = null;
-                appState.isPlaying = false;
-                cancelAnimationFrame(animationFrameId);
-                setTimeout(() => {
-                    if (!appState.isPlaying) appState.playbackProgress = 0;
-                }, 150);
-            }
-        };
-
-        currentSampleDuration = audioBuffer.duration;
-        playbackStartTime = audioCtx.currentTime;
-        sourceNode.start(0);
-        animationFrameId = requestAnimationFrame(updateProgress);
     }
 
     function goToPage(p: number) { if (p !== currentPage) { currentPage = p; loadSamples(); } }

@@ -9,9 +9,26 @@ use app::state::AppState;
 use app::commands;
 use std::fs;
 use tauri::Manager;
+use rodio::OutputStream;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicUsize;
 
 fn main() {
+    // 1. Initialisiere die native Audio-Engine des Betriebssystems
+    let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to initialize audio stream");
+
+    // 2. Enterprise-Hack: Den Stream im RAM "leaken", damit er während der gesamten App-Laufzeit offen bleibt
+    std::mem::forget(_stream);
+
+    // 3. Den Status für unsere Commands vorbereiten
+    let audio_state = app::commands::AudioState {
+        stream_handle,
+        current_sink: Mutex::new(None),
+        playback_id: Arc::new(AtomicUsize::new(0)),
+    };
+
     tauri::Builder::default()
+        .manage(audio_state)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init()) // Aktiviert den direkten File-Stream
         .setup(|app_handle| {
@@ -67,7 +84,9 @@ fn main() {
             commands::create_user_tag,
             commands::delete_user_tag,
             commands::get_all_available_tags,
-            commands::process_audio_pitch
+            commands::play_audio,
+            commands::stop_audio,
+            commands::set_audio_volume
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");

@@ -3,12 +3,12 @@ use crate::vault::scanner;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite};
 use tauri::State;
-use hound::{WavReader, WavWriter, WavSpec, SampleFormat};
+
+use rodio::{Sink, buffer::SamplesBuffer};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use hound::{WavReader, SampleFormat};
 use ssstretch::Stretch;
-use sha2::{Sha256, Digest};
-use std::env;
-use std::fs;
-use std::path::PathBuf;
 
 #[derive(Debug, Serialize, FromRow)]
 pub struct SampleRecord {
@@ -561,48 +561,64 @@ pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<Ta
     Ok(all_tags)
 }
 
+// FIX: current_sink nutzt jetzt Arc<Sink>!
+pub struct AudioState {
+    pub stream_handle: rodio::OutputStreamHandle,
+    pub current_sink: Mutex<Option<Arc<Sink>>>,
+    pub playback_id: Arc<AtomicUsize>,
+}
+
 #[tauri::command]
-pub async fn process_audio_pitch(
+pub fn stop_audio(state: State<'_, AudioState>) {
+    let mut current_sink = state.current_sink.lock().unwrap();
+    if let Some(sink) = current_sink.take() {
+        sink.stop();
+    }
+    state.playback_id.fetch_add(1, Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub fn set_audio_volume(volume: f32, state: State<'_, AudioState>) {
+    if let Some(sink) = state.current_sink.lock().unwrap().as_ref() {
+        sink.set_volume(volume);
+    }
+}
+
+#[tauri::command]
+pub fn play_audio(
     file_path: String,
     semitones: f32,
-    _state: State<'_, AppState>,
-) -> Result<String, String> {
-    // 1. Wenn semitones 0 ist, müssen wir nicht rechnen. Original zurückgeben!
-    if semitones == 0.0 {
-        return Ok(file_path);
+    volume: f32,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    let new_id = state.playback_id.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // FIX: Wir wrappen den Sink in einen Arc, um ihn sicher zu teilen
+    let sink = Arc::new(Sink::try_new(&state.stream_handle).map_err(|e| e.to_string())?);
+    sink.set_volume(volume);
+
+    {
+        let mut current_sink = state.current_sink.lock().unwrap();
+        if let Some(old_sink) = current_sink.take() {
+            old_sink.stop();
+        }
+        *current_sink = Some(Arc::clone(&sink)); // Wir klonen nur die Referenz!
     }
 
-    // 2. Intelligentes Caching (Damit wir nicht 2x das gleiche Sample pitchen)
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}_{}", file_path, semitones).as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    let id_clone = state.playback_id.clone();
 
-    let temp_dir = env::temp_dir().join("samplevault_cache");
-    if !temp_dir.exists() {
-        fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-    }
+    // Der Worker-Thread erbt die original-Referenz des Sinks
+    std::thread::spawn(move || {
+        let mut reader = match WavReader::open(&file_path) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
 
-    let cached_file_path = temp_dir.join(format!("{}.wav", hash));
-    let cached_str = cached_file_path.to_string_lossy().to_string();
-
-    // Latenzfreier Return, wenn wir das Sample schon mal berechnet haben
-    if cached_file_path.exists() {
-        return Ok(cached_str);
-    }
-
-    // 3. DSP ENGINE (In einem Background-Thread, damit Svelte nicht einfriert!)
-    let input_path = file_path.clone();
-    let output_path = cached_file_path.clone();
-
-    tauri::async_runtime::spawn_blocking(move || {
-        // A) Datei öffnen & Metadaten lesen
-        let mut reader = WavReader::open(&input_path).map_err(|e| e.to_string())?;
         let spec = reader.spec();
         let channels = spec.channels as usize;
-        let sample_rate = spec.sample_rate as f32;
+        let sample_rate = spec.sample_rate;
 
-        // B) Audio absolut verlustfrei in 32-Bit Gleitkomma-Zahlen (f32) auslesen
-        let samples: Vec<f32> = match spec.sample_format {
+        let raw_samples: Vec<f32> = match spec.sample_format {
             SampleFormat::Int => {
                 let max_val = 1_f32 / (1_i64 << (spec.bits_per_sample - 1)) as f32;
                 if spec.bits_per_sample <= 16 {
@@ -611,64 +627,53 @@ pub async fn process_audio_pitch(
                     reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 * max_val).collect()
                 }
             }
-            SampleFormat::Float => {
-                reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
-            }
+            SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
         };
 
-        let input_len = samples.len() / channels;
-
-        // C) De-Interleaving: Aus [Links, Rechts, Links, Rechts] wird [[Links], [Rechts]]
-        let mut input_channels = vec![vec![0.0; input_len]; channels];
-        for (i, &sample) in samples.iter().enumerate() {
-            let ch = i % channels;
-            let frame = i / channels;
-            input_channels[ch][frame] = sample;
+        let total_frames = raw_samples.len() / channels;
+        let mut input_channels = vec![vec![0.0; total_frames]; channels];
+        for (i, &sample) in raw_samples.iter().enumerate() {
+            input_channels[i % channels][i / channels] = sample;
         }
 
-        // D) SIGNALSMITH STRETCH ENGINE KONFIGURIEREN
         let mut stretch = Stretch::new();
-        stretch.preset_default(channels as i32, sample_rate);
-
-        // Den Pitch ohne Tempo-Verlust setzen
+        stretch.preset_default(channels as i32, sample_rate as f32);
         stretch.set_transpose_semitones(semitones, None);
 
-        let mut output_channels = vec![vec![0.0f32; input_len]; channels];
+        let chunk_size = 4096;
+        let mut frames_processed = 0;
 
-        // E) AUDIO PROZESSIEREN
-        stretch.process_vec(
-            &input_channels,
-            input_len as i32,
-            &mut output_channels,
-            input_len as i32 // Output = Input, da sich das Tempo nicht ändert!
-        );
-
-        // F) Re-Interleaving (Spuren für das WAV-Format wieder zusammenführen)
-        let mut out_interleaved = Vec::with_capacity(input_len * channels);
-        for frame in 0..input_len {
-            for ch in 0..channels {
-                out_interleaved.push(output_channels[ch][frame]);
+        loop {
+            if id_clone.load(Ordering::SeqCst) != new_id { break; }
+            if sink.len() > 2 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
+
+            let frames_left = total_frames - frames_processed;
+            if frames_left == 0 { break; }
+            let current_chunk = frames_left.min(chunk_size);
+
+            let mut in_chunk = vec![vec![0.0f32; current_chunk]; channels];
+            for ch in 0..channels {
+                in_chunk[ch].copy_from_slice(&input_channels[ch][frames_processed..frames_processed + current_chunk]);
+            }
+
+            let mut out_chunk = vec![vec![0.0f32; current_chunk]; channels];
+            stretch.process_vec(&in_chunk, current_chunk as i32, &mut out_chunk, current_chunk as i32);
+
+            let mut out_interleaved = Vec::with_capacity(current_chunk * channels);
+            for frame in 0..current_chunk {
+                for ch in 0..channels {
+                    out_interleaved.push(out_chunk[ch][frame]);
+                }
+            }
+
+            let buffer = SamplesBuffer::new(channels as u16, sample_rate, out_interleaved);
+            sink.append(buffer);
+            frames_processed += current_chunk;
         }
+    });
 
-        // G) Fertiges Audio in die unsichtbare Cache-Datei schreiben (als 32-bit Float)
-        let out_spec = WavSpec {
-            channels: channels as u16,
-            sample_rate: spec.sample_rate,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::Float,
-        };
-        let mut writer = WavWriter::create(&output_path, out_spec).map_err(|e| e.to_string())?;
-        for sample in out_interleaved {
-            writer.write_sample(sample).map_err(|e| e.to_string())?;
-        }
-        writer.finalize().map_err(|e| e.to_string())?;
-
-        Ok::<(), String>(())
-    })
-        .await
-        .map_err(|e| e.to_string())??;
-
-    // Gib den Pfad der neuen, gepitchten Datei an Svelte zurück
-    Ok(cached_str)
+    Ok(())
 }
