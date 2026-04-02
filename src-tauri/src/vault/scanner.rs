@@ -1,18 +1,21 @@
 use sqlx::SqlitePool;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 use futures::stream::{self, StreamExt};
 use walkdir::WalkDir;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+use lofty::{read_from_path, TaggedFileExt};
+use sha2::{Sha256, Digest};
+
 use crate::audio::{analyzer, waveform, metadata_parser};
 use crate::vault::taxonomy;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["wav", "mp3", "aiff", "flac", "ogg", "m4a"];
 
-// Das Enterprise Progress-Payload für Svelte
 #[derive(Clone, Serialize)]
 pub struct ScanProgressPayload {
     pub total: usize,
@@ -42,19 +45,14 @@ struct CpuAnalysisResult {
     sample_rate: i64,
     channels: i64,
     bit_depth: i64,
-    bpm: Option<f64>,        // NEU
-    key_signature: Option<String>, // NEU
+    bpm: Option<f64>,
+    key_signature: Option<String>,
     instrument_type: Option<String>,
     waveform_data: Vec<u8>,
     tags_json: String,
+    cover_path: Option<String>, // NEU: Pfad zum deduplizierten Cover
 }
 
-/// Builds a fast deduplication fingerprint from file metadata alone.
-///
-/// Uses `size_bytes + last_modified_unix_seconds` instead of a full SHA256 read.
-/// This is 100–1000× faster for large files and has negligible collision risk
-/// for a local sample library (two files with identical size AND mtime are
-/// effectively identical).
 fn fast_fingerprint(path: &Path) -> Result<(String, i64), String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("metadata error: {}", e))?;
@@ -71,12 +69,48 @@ fn fast_fingerprint(path: &Path) -> Result<(String, i64), String> {
     Ok((fingerprint, size))
 }
 
-fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
+/// Extrahiert das Cover-Bild, erstellt einen SHA256-Hash zur Deduplizierung und speichert es auf der Disk.
+fn extract_and_save_cover(file_path: &Path, app_data_dir: &Path) -> Option<String> {
+    let tagged_file = read_from_path(file_path).ok()?;
+    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+
+    let picture = tag.pictures().first()?;
+    let pic_data = picture.data();
+
+    if pic_data.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(pic_data);
+    let hash = format!("{:x}", hasher.finalize());
+
+    let covers_dir = app_data_dir.join("covers");
+    if !covers_dir.exists() {
+        let _ = fs::create_dir_all(&covers_dir);
+    }
+
+    // ENTERPRISE FIX: Sicheres Formatieren des MimeType-Enums in einen String
+    let ext = match picture.mime_type() {
+        Some(mime) if format!("{:?}", mime).to_lowercase().contains("png") => "png",
+        _ => "jpg",
+    };
+
+    let cover_file_path = covers_dir.join(format!("{}.{}", hash, ext));
+
+    // Deduplizierung: Nur auf die Festplatte schreiben, wenn der Hash noch nicht existiert
+    if !cover_file_path.exists() {
+        let _ = fs::write(&cover_file_path, pic_data);
+    }
+
+    Some(cover_file_path.to_string_lossy().to_string())
+}
+
+fn analyze_file_cpu_heavy(path: &Path, app_data_dir: &Path) -> Result<CpuAnalysisResult, String> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     let original_path = path.to_string_lossy().to_string();
     let extension = path.extension().unwrap_or_default().to_string_lossy().to_string().to_lowercase();
 
-    // Fast fingerprint: replaces full SHA256 read — avoids reading entire file
     let (file_hash, file_size) = fast_fingerprint(path)?;
 
     let waveform_data = waveform::extract_waveform(path, 40).unwrap_or_else(|_| {
@@ -88,21 +122,19 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
         Err(_) => (0, 44100, 2, 16)
     };
 
-    // 1. ZUERST Taxonomie-Analyse (Erkennt One-Shot vs Loop)
     let engine = taxonomy::TaxonomyEngine::global();
     let tags_array = engine.analyze(path, duration_ms);
     let tags_json = serde_json::to_string(&tags_array).unwrap_or_else(|_| "[]".to_string());
 
-    // 2. Format auswerten
     let is_loop = tags_array.iter().any(|t| t["category"] == "Format" && t["value"] == "Loop");
-
-    // 3. DANACH Dateinamen parsen (und das Wissen über das Format übergeben!)
     let parsed_meta = metadata_parser::parse_filename(&filename, is_loop);
 
-    // Fallback für die alte Spalte
     let instrument_type = tags_array.iter()
         .find(|t| t["category"] == "Drums" || t["category"] == "Synth" || t["category"] == "Bass")
         .map(|t| t["value"].as_str().unwrap_or("").to_string());
+
+    // Cover extrahieren und auf Disk sichern
+    let cover_path = extract_and_save_cover(path, app_data_dir);
 
     Ok(CpuAnalysisResult {
         original_path, filename, extension, file_hash, file_size,
@@ -110,14 +142,15 @@ fn analyze_file_cpu_heavy(path: &Path) -> Result<CpuAnalysisResult, String> {
         bpm: parsed_meta.bpm,
         key_signature: parsed_meta.key,
         instrument_type,
-        waveform_data, tags_json
+        waveform_data, tags_json, cover_path
     })
 }
 
 pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> Result<usize, String> {
     tracing::info!("Starting directory scan for: {}", path);
 
-    // ── 1. Walk directory (blocking I/O off the async runtime) ───────────────
+    let app_data_dir = app.path().app_data_dir().expect("Critical: Failed to resolve app data directory");
+
     let files = tokio::task::spawn_blocking(move || {
         let mut valid_files = Vec::new();
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
@@ -137,18 +170,15 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
         return Ok(0);
     }
 
-    // ── 2. Load all known paths from DB (one query, O(n) memory) ─────────────
-    // This lets us skip CPU-heavy analysis for files already in the library.
     let known_paths: HashSet<String> = sqlx::query_scalar::<_, String>(
         "SELECT original_path FROM samples"
     )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
-    // ── 3. Filter to only new/unknown files ───────────────────────────────────
     let files: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| !known_paths.contains(p.to_string_lossy().as_ref()))
@@ -169,9 +199,8 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
 
     let concurrency_limit = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2;
     let mut processed_count = 0;
-    let mut scanned_so_far = 0; // Neu: Zählt die verarbeiteten Dateien für die UI
+    let mut scanned_so_far = 0;
 
-    // Initiales Event feuern (0%)
     let _ = app.emit("scan-progress", ScanProgressPayload {
         total: total_files,
         current: 0,
@@ -179,7 +208,8 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
     });
 
     let stream = stream::iter(files).map(|file_path| {
-        tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&file_path))
+        let app_data_dir_clone = app_data_dir.clone();
+        tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&file_path, &app_data_dir_clone))
     }).buffer_unordered(concurrency_limit);
 
     let mut chunk_stream = stream.chunks(500);
@@ -192,14 +222,14 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
         for task_res in chunk {
             if let Ok(Ok(analysis)) = task_res {
                 let id = Uuid::new_v4().to_string();
-                last_filename = analysis.filename.clone(); // Merken für die UI
+                last_filename = analysis.filename.clone();
 
                 let insert_result = sqlx::query(
                     r#"
                     INSERT OR IGNORE INTO samples (
                         id, file_hash, original_path, filename, extension, file_size,
-                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data, cover_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
                 )
                     .bind(id)
@@ -212,11 +242,12 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
                     .bind(analysis.sample_rate)
                     .bind(analysis.channels)
                     .bind(analysis.bit_depth)
-                    .bind(analysis.bpm)              // NEU
-                    .bind(&analysis.key_signature)   // NEU
+                    .bind(analysis.bpm)
+                    .bind(&analysis.key_signature)
                     .bind(&analysis.instrument_type)
                     .bind(&analysis.tags_json)
                     .bind(&analysis.waveform_data)
+                    .bind(&analysis.cover_path) // NEU
                     .execute(&mut *tx)
                     .await;
 
@@ -229,7 +260,6 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
 
         tx.commit().await.map_err(|e| e.to_string())?;
 
-        // Progress an Frontend senden, sobald der Chunk sicher auf der SSD liegt
         scanned_so_far += chunk_len;
         let _ = app.emit("scan-progress", ScanProgressPayload {
             total: total_files,
@@ -242,9 +272,13 @@ pub async fn scan_directory(path: String, pool: SqlitePool, app: AppHandle) -> R
     Ok(processed_count)
 }
 
-pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
+// HINWEIS: Signatur wurde um `app: AppHandle` erweitert, da wir den Ordner für das Cover auflösen müssen.
+// Falls du diese Funktion aus `commands.rs` aufrufst, musst du dort `app: AppHandle` als Parameter hinzufügen.
+pub async fn process_single_file(path: PathBuf, pool: SqlitePool, app: AppHandle) {
+    let app_data_dir = app.path().app_data_dir().unwrap_or_default();
     let p_clone = path.clone();
-    let analysis_res = tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&p_clone)).await;
+
+    let analysis_res = tokio::task::spawn_blocking(move || analyze_file_cpu_heavy(&p_clone, &app_data_dir)).await;
 
     if let Ok(Ok(analysis)) = analysis_res {
         let id = Uuid::new_v4().to_string();
@@ -254,8 +288,8 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             r#"
                     INSERT OR IGNORE INTO samples (
                         id, file_hash, original_path, filename, extension, file_size,
-                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_ms, sample_rate, channels, bit_depth, bpm, key_signature, instrument_type, tags, waveform_data, cover_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
         )
             .bind(id)
@@ -268,11 +302,12 @@ pub async fn process_single_file(path: PathBuf, pool: SqlitePool) {
             .bind(analysis.sample_rate)
             .bind(analysis.channels)
             .bind(analysis.bit_depth)
-            .bind(analysis.bpm)              // NEU
-            .bind(&analysis.key_signature)   // NEU
+            .bind(analysis.bpm)
+            .bind(&analysis.key_signature)
             .bind(&analysis.instrument_type)
             .bind(&analysis.tags_json)
             .bind(&analysis.waveform_data)
+            .bind(&analysis.cover_path) // NEU
             .execute(&pool)
             .await;
 

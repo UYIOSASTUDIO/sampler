@@ -39,6 +39,8 @@ tracing-appender = "0.2.4"
 aho-corasick = "1.1.2"
 regex = "1.10"
 rodio = "0.17.3"
+lofty = "0.18"  # Der Industriestandard für Audio-Metadaten in Rust
+sha2 = "0.10"   # Für die Deduplizierung
 
 # --- AUDIO PROCESSING ---
 # hound entfernt: Symphonia übernimmt alle Formate (WAV, MP3, FLAC, AIFF, OGG, M4A)

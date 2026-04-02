@@ -18,6 +18,7 @@
         waveform_data: number[] | null;
         tags: string;
         is_liked: boolean;
+        cover_path: string | null; // <--- NEU: Der Pfad zum extrahierten Bild
     };
 
     function parseTags(tagsJson: string) {
@@ -302,14 +303,14 @@
                 currentPage++; await loadSamples();
                 if (samples.length > 0) {
                     await handlePlayRequest(samples[0]);
-                    setTimeout(() => document.getElementById(`sample-${samples[0].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+                    setTimeout(() => scrollToSample(samples[0].id), 50);
                 }
             }
             return;
         } else currentIndex++;
 
         await handlePlayRequest(samples[currentIndex]);
-        setTimeout(() => document.getElementById(`sample-${samples[currentIndex].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+        setTimeout(() => scrollToSample(samples[currentIndex].id), 50);
     }
 
     async function playPrevSample() {
@@ -322,14 +323,31 @@
                 currentPage--; await loadSamples();
                 if (samples.length > 0) {
                     await handlePlayRequest(samples[samples.length - 1]);
-                    setTimeout(() => document.getElementById(`sample-${samples[samples.length - 1].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+                    setTimeout(() => scrollToSample(samples[samples.length - 1].id), 50);
                 }
             }
             return;
         } else currentIndex--;
 
         await handlePlayRequest(samples[currentIndex]);
-        setTimeout(() => document.getElementById(`sample-${samples[currentIndex].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+        setTimeout(() => scrollToSample(samples[currentIndex].id), 50);
+    }
+
+    // --- ENTERPRISE SCROLL LOGIC ---
+    // Scrollt nur auf der vertikalen Achse (Y) und verhindert das horizontale Verschieben des Layouts
+    function scrollToSample(id: string) {
+        const el = document.getElementById(`sample-${id}`);
+        if (!el || !scrollContainer) return;
+
+        const elRect = el.getBoundingClientRect();
+        const containerRect = scrollContainer.getBoundingClientRect();
+
+        // Prüfen, ob das Element oben oder unten aus dem sichtbaren Bereich ragt
+        if (elRect.top < containerRect.top) {
+            scrollContainer.scrollBy({ top: elRect.top - containerRect.top - 20, behavior: 'smooth' });
+        } else if (elRect.bottom > containerRect.bottom) {
+            scrollContainer.scrollBy({ top: elRect.bottom - containerRect.bottom + 20, behavior: 'smooth' });
+        }
     }
 
     async function handleKeydown(e: KeyboardEvent) {
@@ -352,7 +370,7 @@
                         if (samples.length > 0) {
                             await handlePlayRequest(samples[0]);
                             await tick();
-                            document.getElementById(`sample-${samples[0].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            scrollToSample(samples[0].id); // GEÄNDERT
                         }
                     }
                     return;
@@ -365,7 +383,7 @@
                         if (samples.length > 0) {
                             await handlePlayRequest(samples[samples.length - 1]);
                             await tick();
-                            document.getElementById(`sample-${samples[samples.length - 1].id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                            scrollToSample(samples[samples.length - 1].id); // GEÄNDERT
                         }
                     }
                     return;
@@ -375,7 +393,7 @@
             const nextSample = samples[currentIndex];
             handlePlayRequest(nextSample);
             await tick();
-            document.getElementById(`sample-${nextSample.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            scrollToSample(nextSample.id); // GEÄNDERT
 
         } else if (e.key === 'ArrowLeft') {
             e.preventDefault();
@@ -809,9 +827,10 @@
 </script>
 
 {#if appState.currentView === 'sounds'}
-    <div class="flex h-full w-full overflow-hidden">
-        <div class="flex-1 overflow-y-auto transition-all duration-300" bind:this={scrollContainer}>
-            <div class="px-8 pt-8 pb-2">
+    <div class="flex h-full w-full overflow-hidden relative">
+        <div class="flex-1 overflow-y-auto overflow-x-clip transition-all duration-300 {appState.selectedSampleIds.length > 0 ? 'mr-72' : 'mr-0'}" bind:this={scrollContainer}>
+
+            <div class="pl-8 pr-8 pt-8 pb-2 w-full">
                 <div class="mb-6 flex items-end justify-between border-b border-zinc-200 pb-0 dark:border-zinc-800">
                     <div class="flex-1">
                         <div class="flex items-center gap-6 mb-4">
@@ -825,7 +844,6 @@
                             <button onclick={() => { appState.activeSoundsTab = 'samples'; appState.filters.collectionId = null; appState.filters.onlyLiked = false; currentPage = 1; loadSamples(); }} class="pb-2 text-sm font-semibold transition-colors cursor-pointer {appState.activeSoundsTab === 'samples' ? 'border-b-2 border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100' : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 border-b-2 border-transparent'}">Samples</button>
                             <button onclick={() => { appState.activeSoundsTab = 'collections'; appState.filters.collectionId = null; appState.filters.onlyLiked = false; }} class="pb-2 text-sm font-semibold transition-colors cursor-pointer {appState.activeSoundsTab === 'collections' ? 'border-b-2 border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100' : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 border-b-2 border-transparent'}">Collections</button>
                         </div>
-
                     </div>
                     <div class="flex flex-col items-end gap-3 pb-2">
                         {#if isScanning && scanTotal > 0}
@@ -855,7 +873,7 @@
             </div>
 
             {#if appState.activeSoundsTab === 'collections' && appState.filters.collectionId === null && !appState.filters.onlyLiked}
-                <div class="px-8 pb-8 pt-4">
+                <div class="pl-8 pr-8 pb-8 pt-4 w-full">
                     <div class="grid grid-cols-2 gap-6 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                         <button onclick={() => { appState.filters.onlyLiked = true; currentPage = 1; loadSamples(); }} class="group flex aspect-square cursor-pointer flex-col justify-between text-left transition-all hover:-translate-y-1">
                             <div class="flex h-full w-full flex-col items-center justify-center rounded-2xl border border-red-100 bg-gradient-to-br from-red-50 to-red-100/50 shadow-sm transition-all group-hover:shadow-md dark:border-red-900/30 dark:from-red-950/40 dark:to-red-900/10">
@@ -879,296 +897,306 @@
                     </div>
                 </div>
             {:else}
-                <div class="px-8 pb-8">
-                    <div class="mb-6 space-y-3">
-                        <div class="flex flex-wrap items-center gap-2">
-                            <div class="relative">
-                                <button onclick={(e) => toggleDropdown('instrument', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.instruments.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
-                                    Instrument {#if appState.filters.instruments.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.instruments.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
-                                </button>
-                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'instrument' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                    <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
-                                        {#each availableTags.filter(t => !['Genre', 'Format', 'Key', 'Character'].includes(t.category)) as tag}
-                                            <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive(tag.category, tag.value)} onchange={() => toggleFilterTag(tag.category, tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
-                                        {/each}
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="relative">
-                                <button onclick={(e) => toggleDropdown('genre', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.genres.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
-                                    Genre {#if appState.filters.genres.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.genres.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
-                                </button>
-                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'genre' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                    <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
-                                        {#each availableTags.filter(t => t.category === 'Genre') as tag}
-                                            <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Genre', tag.value)} onchange={() => toggleFilterTag('Genre', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
-                                        {/each}
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="relative">
-                                <button onclick={(e) => toggleDropdown('key', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.keys.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
-                                    Key {#if appState.filters.keys.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.keys.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
-                                </button>
-                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'key' ? 'flex' : 'hidden'} w-64 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                    <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50 w-full">
-                                        <button onclick={() => switchKeyMode('min')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'min' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Minor</button>
-                                        <button onclick={() => switchKeyMode('maj')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'maj' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Major</button>
-                                    </div>
-                                    <div class="relative flex w-full h-24 rounded border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
-                                        {#each whiteKeys as note} <button onclick={() => togglePianoKey(note)} class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer {isPianoKeyActive(note) ? 'bg-zinc-200 dark:bg-zinc-600 text-zinc-900 dark:text-white shadow-inner' : 'bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700'}">{note}</button> {/each}
-                                        {#each blackKeys as bk} <button onclick={() => togglePianoKey(bk.note)} style="left: {bk.left}; transform: translateX(-50%);" class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10 {isPianoKeyActive(bk.note) ? 'bg-zinc-500 text-white shadow-inner' : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800 dark:bg-black dark:hover:bg-zinc-900'}">{bk.note}</button> {/each}
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="relative">
-                                <button onclick={(e) => toggleDropdown('bpm', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {(appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max) ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
-                                    BPM {#if appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">!</span>{/if}<ChevronDown size={14} class="opacity-50" />
-                                </button>
-                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'bpm' ? 'flex' : 'hidden'} w-56 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                    <div class="flex items-center justify-between border-b border-zinc-100 pb-2 dark:border-zinc-800">
-                                        <span class="text-xs font-semibold">Mode</span><label class="flex items-center gap-2 text-[10px] uppercase font-bold tracking-wider cursor-pointer"><input type="checkbox" bind:checked={appState.filters.bpm.isRange} class="rounded border-zinc-300 accent-zinc-900"> Range</label>
-                                    </div>
-                                    {#if appState.filters.bpm.isRange}
-                                        <div class="flex items-center gap-2"><input type="number" bind:value={appState.filters.bpm.min} placeholder="Min" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"><span class="text-xs text-zinc-500">-</span><input type="number" bind:value={appState.filters.bpm.max} placeholder="Max" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"></div>
-                                    {:else}
-                                        <input type="number" bind:value={appState.filters.bpm.exact} placeholder="Exact BPM (e.g. 120)" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100">
-                                    {/if}
-                                    <div class="flex gap-2 mt-1">
-                                        <button onclick={() => { appState.filters.bpm.exact = null; appState.filters.bpm.min = null; appState.filters.bpm.max = null; currentPage = 1; loadSamples(); openDropdown = null; }} class="w-1/3 rounded border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer">Clear</button>
-                                        <button onclick={() => { openDropdown = null; currentPage = 1; loadSamples(); }} class="w-2/3 rounded bg-zinc-900 px-2 py-1.5 text-xs text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white cursor-pointer">Apply</button>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="relative">
-                                <button onclick={(e) => toggleDropdown('format', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.formats.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
-                                    Format {#if appState.filters.formats.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.formats.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
-                                </button>
-                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'format' ? 'flex' : 'hidden'} w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                    <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
-                                        {#each availableTags.filter(t => t.category === 'Format') as tag}
-                                            <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Format', tag.value)} onchange={() => toggleFilterTag('Format', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
-                                        {/each}
-                                    </div>
-                                </div>
-                            </div>
-
-                            {#if appState.filters.instruments.length > 0 || appState.filters.genres.length > 0 || appState.filters.formats.length > 0 || appState.filters.keys.length > 0 || appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}
-                                <button onclick={clearAllFilters} class="ml-2 flex h-8 items-center text-xs font-semibold text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 transition-colors cursor-pointer">Clear all</button>
-                            {/if}
-
-                            <!-- ─── PITCH PILL ──────────────────────────────────────────────────────── -->
-                            <!-- Vertikaler Divider: signalisiert "andere Kategorie" als die Filter -->
-                            <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
-
-                            <div class="relative shrink-0">
-                                <!-- Trigger: Pill-Form + Emerald-Akzent unterscheidet es klar von normalen Filtern -->
-                                <button
-                                    onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalkey' ? null : 'globalkey'; }}
-                                    class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
-                                           {appState.globalKey
-                                               ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm shadow-emerald-500/30 dark:shadow-emerald-500/20'
-                                               : 'border-emerald-500/40 bg-emerald-50 text-emerald-700 hover:border-emerald-500 hover:bg-emerald-100 dark:border-emerald-500/20 dark:bg-emerald-500/5 dark:text-emerald-400 dark:hover:border-emerald-500/50 dark:hover:bg-emerald-500/10'}"
-                                >
-                                    <Music2 size={13} class="shrink-0 {appState.globalKey ? 'opacity-100' : 'opacity-70'}" />
-                                    <span>{globalKeyLabel}</span>
-                                    {#if !appState.globalKey}
-                                        <ChevronDown size={12} class="opacity-50" />
-                                    {:else}
-                                        <!-- Aktiv-Pulse zeigt dass Auto-Pitch läuft -->
-                                        <span class="relative flex h-1.5 w-1.5 shrink-0">
-                                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-                                            <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
-                                        </span>
-                                    {/if}
-                                </button>
-
-                                <!-- Piano-Dropdown -->
-                                {#if openDropdown === 'globalkey'}
-                                    <div
-                                        onclick={(e) => e.stopPropagation()}
-                                        class="absolute right-0 top-full mt-2 flex w-72 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50"
-                                    >
-                                        <!-- Header -->
-                                        <div class="flex items-center gap-2 pb-1 border-b border-zinc-100 dark:border-zinc-800">
-                                            <Music2 size={13} class="text-emerald-500 shrink-0" />
-                                            <span class="text-[11px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Auto-Pitch Key</span>
-                                        </div>
-
-                                        <!-- Maj / Min Toggle -->
-                                        <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50">
-                                            <button
-                                                onclick={() => { appState.globalKeyMode = 'min'; }}
-                                                class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
-                                                       {appState.globalKeyMode === 'min'
-                                                           ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
-                                                           : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
-                                            >Minor</button>
-                                            <button
-                                                onclick={() => { appState.globalKeyMode = 'maj'; }}
-                                                class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
-                                                       {appState.globalKeyMode === 'maj'
-                                                           ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
-                                                           : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
-                                            >Major</button>
-                                        </div>
-
-                                        <!-- Piano Keyboard -->
-                                        <div class="relative flex w-full h-24 rounded-lg border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
-                                            {#each whiteKeys as note}
-                                                <button
-                                                    onclick={() => setGlobalPianoKey(note)}
-                                                    class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer
-                                                           {isGlobalKeyActive(note)
-                                                               ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
-                                                               : 'bg-white dark:bg-zinc-800 text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700'}"
-                                                >{note}</button>
-                                            {/each}
-                                            {#each blackKeys as bk}
-                                                <button
-                                                    onclick={() => setGlobalPianoKey(bk.note)}
-                                                    style="left: {bk.left}; transform: translateX(-50%);"
-                                                    class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10
-                                                           {isGlobalKeyActive(bk.note)
-                                                               ? 'bg-emerald-600 text-white shadow-inner'
-                                                               : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-700 dark:bg-black dark:hover:bg-zinc-900'}"
-                                                >{bk.note}</button>
+                <div class="pb-8">
+                    <div class="pl-8 pr-8 w-full">
+                        <div class="mb-6 space-y-3">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('instrument', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.instruments.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Instrument {#if appState.filters.instruments.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.instruments.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'instrument' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each availableTags.filter(t => !['Genre', 'Format', 'Key', 'Character'].includes(t.category)) as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive(tag.category, tag.value)} onchange={() => toggleFilterTag(tag.category, tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
                                             {/each}
                                         </div>
-
-                                        <!-- Hint Text -->
-                                        {#if appState.globalKey}
-                                            <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
-                                                Samples in <span class="font-semibold text-emerald-600 dark:text-emerald-400">{globalKeyLabel}</span> werden automatisch gepitched. {appState.globalKeyMode === 'min' ? 'Major-Samples' : 'Minor-Samples'} landen auf dem Relativ-{appState.globalKeyMode === 'min' ? 'Dur' : 'Moll'}.
-                                            </p>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('genre', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.genres.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Genre {#if appState.filters.genres.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.genres.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'genre' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each availableTags.filter(t => t.category === 'Genre') as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Genre', tag.value)} onchange={() => toggleFilterTag('Genre', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('key', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.keys.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Key {#if appState.filters.keys.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.keys.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'key' ? 'flex' : 'hidden'} w-64 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50 w-full">
+                                            <button onclick={() => switchKeyMode('min')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'min' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Minor</button>
+                                            <button onclick={() => switchKeyMode('maj')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'maj' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Major</button>
+                                        </div>
+                                        <div class="relative flex w-full h-24 rounded border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
+                                            {#each whiteKeys as note} <button onclick={() => togglePianoKey(note)} class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer {isPianoKeyActive(note) ? 'bg-zinc-200 dark:bg-zinc-600 text-zinc-900 dark:text-white shadow-inner' : 'bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700'}">{note}</button> {/each}
+                                            {#each blackKeys as bk} <button onclick={() => togglePianoKey(bk.note)} style="left: {bk.left}; transform: translateX(-50%);" class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10 {isPianoKeyActive(bk.note) ? 'bg-zinc-500 text-white shadow-inner' : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800 dark:bg-black dark:hover:bg-zinc-900'}">{bk.note}</button> {/each}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('bpm', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {(appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max) ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        BPM {#if appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">!</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'bpm' ? 'flex' : 'hidden'} w-56 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="flex items-center justify-between border-b border-zinc-100 pb-2 dark:border-zinc-800">
+                                            <span class="text-xs font-semibold">Mode</span><label class="flex items-center gap-2 text-[10px] uppercase font-bold tracking-wider cursor-pointer"><input type="checkbox" bind:checked={appState.filters.bpm.isRange} class="rounded border-zinc-300 accent-zinc-900"> Range</label>
+                                        </div>
+                                        {#if appState.filters.bpm.isRange}
+                                            <div class="flex items-center gap-2"><input type="number" bind:value={appState.filters.bpm.min} placeholder="Min" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"><span class="text-xs text-zinc-500">-</span><input type="number" bind:value={appState.filters.bpm.max} placeholder="Max" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"></div>
+                                        {:else}
+                                            <input type="number" bind:value={appState.filters.bpm.exact} placeholder="Exact BPM (e.g. 120)" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100">
                                         {/if}
+                                        <div class="flex gap-2 mt-1">
+                                            <button onclick={() => { appState.filters.bpm.exact = null; appState.filters.bpm.min = null; appState.filters.bpm.max = null; currentPage = 1; loadSamples(); openDropdown = null; }} class="w-1/3 rounded border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer">Clear</button>
+                                            <button onclick={() => { openDropdown = null; currentPage = 1; loadSamples(); }} class="w-2/3 rounded bg-zinc-900 px-2 py-1.5 text-xs text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white cursor-pointer">Apply</button>
+                                        </div>
+                                    </div>
+                                </div>
 
-                                        <!-- Turn Off -->
-                                        <button
-                                            onclick={() => { appState.globalKey = null; openDropdown = null; }}
-                                            class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
-                                        >Turn Off</button>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('format', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.formats.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Format {#if appState.filters.formats.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.formats.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'format' ? 'flex' : 'hidden'} w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each availableTags.filter(t => t.category === 'Format') as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Format', tag.value)} onchange={() => toggleFilterTag('Format', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {#if appState.filters.instruments.length > 0 || appState.filters.genres.length > 0 || appState.filters.formats.length > 0 || appState.filters.keys.length > 0 || appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}
+                                    <button onclick={clearAllFilters} class="ml-2 flex h-8 items-center text-xs font-semibold text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 transition-colors cursor-pointer">Clear all</button>
+                                {/if}
+
+                                <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
+
+                                <div class="relative shrink-0">
+                                    <button
+                                            onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalkey' ? null : 'globalkey'; }}
+                                            class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
+                                               {appState.globalKey
+                                                   ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm shadow-emerald-500/30 dark:shadow-emerald-500/20'
+                                                   : 'border-emerald-500/40 bg-emerald-50 text-emerald-700 hover:border-emerald-500 hover:bg-emerald-100 dark:border-emerald-500/20 dark:bg-emerald-500/5 dark:text-emerald-400 dark:hover:border-emerald-500/50 dark:hover:bg-emerald-500/10'}"
+                                    >
+                                        <Music2 size={13} class="shrink-0 {appState.globalKey ? 'opacity-100' : 'opacity-70'}" />
+                                        <span>{globalKeyLabel}</span>
+                                        {#if !appState.globalKey}
+                                            <ChevronDown size={12} class="opacity-50" />
+                                        {:else}
+                                            <span class="relative flex h-1.5 w-1.5 shrink-0">
+                                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
+                                            </span>
+                                        {/if}
+                                    </button>
+
+                                    {#if openDropdown === 'globalkey'}
+                                        <div
+                                                onclick={(e) => e.stopPropagation()}
+                                                class="absolute right-0 top-full mt-2 flex w-72 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50"
+                                        >
+                                            <div class="flex items-center gap-2 pb-1 border-b border-zinc-100 dark:border-zinc-800">
+                                                <Music2 size={13} class="text-emerald-500 shrink-0" />
+                                                <span class="text-[11px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Auto-Pitch Key</span>
+                                            </div>
+
+                                            <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50">
+                                                <button
+                                                        onclick={() => { appState.globalKeyMode = 'min'; }}
+                                                        class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                           {appState.globalKeyMode === 'min'
+                                                               ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                               : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                                >Minor</button>
+                                                <button
+                                                        onclick={() => { appState.globalKeyMode = 'maj'; }}
+                                                        class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                           {appState.globalKeyMode === 'maj'
+                                                               ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                               : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                                >Major</button>
+                                            </div>
+
+                                            <div class="relative flex w-full h-24 rounded-lg border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
+                                                {#each whiteKeys as note}
+                                                    <button
+                                                            onclick={() => setGlobalPianoKey(note)}
+                                                            class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer
+                                                               {isGlobalKeyActive(note)
+                                                                   ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                                                                   : 'bg-white dark:bg-zinc-800 text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700'}"
+                                                    >{note}</button>
+                                                {/each}
+                                                {#each blackKeys as bk}
+                                                    <button
+                                                            onclick={() => setGlobalPianoKey(bk.note)}
+                                                            style="left: {bk.left}; transform: translateX(-50%);"
+                                                            class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10
+                                                               {isGlobalKeyActive(bk.note)
+                                                                   ? 'bg-emerald-600 text-white shadow-inner'
+                                                                   : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-700 dark:bg-black dark:hover:bg-zinc-900'}"
+                                                    >{bk.note}</button>
+                                                {/each}
+                                            </div>
+
+                                            {#if appState.globalKey}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Samples in <span class="font-semibold text-emerald-600 dark:text-emerald-400">{globalKeyLabel}</span> werden automatisch gepitched. {appState.globalKeyMode === 'min' ? 'Major-Samples' : 'Minor-Samples'} landen auf dem Relativ-{appState.globalKeyMode === 'min' ? 'Dur' : 'Moll'}.
+                                                </p>
+                                            {/if}
+
+                                            <button
+                                                    onclick={() => { appState.globalKey = null; openDropdown = null; }}
+                                                    class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
+                                            >Turn Off</button>
+                                        </div>
+                                    {/if}
+                                </div>
+
+                                <div class="ml-auto flex items-center gap-2">
+                                    <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Match:</span>
+                                    <div class="flex h-8 rounded-full border border-zinc-200 bg-zinc-50 p-[3px] dark:border-zinc-700/50 dark:bg-zinc-900">
+                                        <button onclick={() => { appState.filters.tagMatchMode = 'OR'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'OR' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Either</button>
+                                        <button onclick={() => { appState.filters.tagMatchMode = 'AND'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'AND' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Both</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="relative w-full">
+                                <div class="flex w-full flex-wrap content-start items-start gap-2 pr-10 transition-all {isTagsExpanded ? 'h-auto pb-1' : 'h-6 overflow-hidden'}">
+                                    {#each sortedAvailableTags as tag (tag.category + tag.value)}
+                                        <button onclick={() => toggleFilterTag(tag.category, tag.value)} class="shrink-0 flex items-center h-6 rounded-full border px-3 text-[11px] font-semibold cursor-pointer transition-colors {isTagActive(tag.category, tag.value) ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900' : 'border-zinc-200 bg-zinc-50 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-400 dark:hover:bg-zinc-800'}">{tag.value} {#if isTagActive(tag.category, tag.value)}<span class="ml-1.5 opacity-50 font-normal hover:opacity-100">✕</span>{/if}</button>
+                                    {/each}
+                                </div>
+                                {#if sortedAvailableTags.length > 0}
+                                    <div class="absolute right-0 top-0 h-6 bg-gradient-to-l from-white via-white to-transparent pl-8 pr-1 dark:from-[#18181b] dark:via-[#18181b]">
+                                        <button onclick={() => isTagsExpanded = !isTagsExpanded} class="flex h-full items-center justify-center rounded px-1.5 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer">{#if isTagsExpanded}<span class="text-sm font-bold leading-none mt-[1px]">✕</span>{:else}<span class="text-sm font-bold leading-none tracking-widest -mt-2">...</span>{/if}</button>
                                     </div>
                                 {/if}
                             </div>
-                            <!-- ─────────────────────────────────────────────────────────────────────── -->
-
-                            <div class="ml-auto flex items-center gap-2">
-                                <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Match:</span>
-                                <div class="flex h-8 rounded-full border border-zinc-200 bg-zinc-50 p-[3px] dark:border-zinc-700/50 dark:bg-zinc-900">
-                                    <button onclick={() => { appState.filters.tagMatchMode = 'OR'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'OR' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Either</button>
-                                    <button onclick={() => { appState.filters.tagMatchMode = 'AND'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'AND' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Both</button>
-                                </div>
-                            </div>
                         </div>
 
-                        <div class="relative w-full">
-                            <div class="flex w-full flex-wrap content-start items-start gap-2 pr-10 transition-all {isTagsExpanded ? 'h-auto pb-1' : 'h-6 overflow-hidden'}">
-                                {#each sortedAvailableTags as tag (tag.category + tag.value)}
-                                    <button onclick={() => toggleFilterTag(tag.category, tag.value)} class="shrink-0 flex items-center h-6 rounded-full border px-3 text-[11px] font-semibold cursor-pointer transition-colors {isTagActive(tag.category, tag.value) ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900' : 'border-zinc-200 bg-zinc-50 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-400 dark:hover:bg-zinc-800'}">{tag.value} {#if isTagActive(tag.category, tag.value)}<span class="ml-1.5 opacity-50 font-normal hover:opacity-100">✕</span>{/if}</button>
-                                {/each}
-                            </div>
-                            {#if sortedAvailableTags.length > 0}
-                                <div class="absolute right-0 top-0 h-6 bg-gradient-to-l from-white via-white to-transparent pl-8 pr-1 dark:from-[#18181b] dark:via-[#18181b]">
-                                    <button onclick={() => isTagsExpanded = !isTagsExpanded} class="flex h-full items-center justify-center rounded px-1.5 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer">{#if isTagsExpanded}<span class="text-sm font-bold leading-none mt-[1px]">✕</span>{:else}<span class="text-sm font-bold leading-none tracking-widest -mt-2">...</span>{/if}</button>
-                                </div>
-                            {/if}
-                        </div>
-                    </div>
-
-                    <div class="mb-4 flex items-center justify-between text-sm text-zinc-500 relative">
-                        <span>{#if isLoading}Loading...{:else}{totalItems} results{/if}</span>
-                        <div class="flex items-center gap-3">
-                            <span class="text-xs font-medium">Sort by:</span>
-                            <div class="flex items-center rounded-md border border-zinc-200 bg-white p-0.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-                                <div class="relative">
-                                    <button onclick={(e) => { e.stopPropagation(); isSortDropdownOpen = !isSortDropdownOpen; openDropdown = null; }} class="flex h-7 items-center gap-2 rounded px-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors cursor-pointer">{sortField === 'name' ? 'Alphabetical' : sortField === 'type' ? 'Instrument Type' : sortField === 'pack' ? 'Sample Pack' : 'Randomize'} <ChevronDown size={14} class="opacity-50" /></button>
-                                    {#if isSortDropdownOpen}
-                                        <div onclick={(e) => e.stopPropagation()} class="absolute right-0 top-full mt-1 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                            <button onclick={() => { sortField = 'name'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'name' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Alphabetical</button>
-                                            <button onclick={() => { sortField = 'type'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'type' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Instrument Type</button>
-                                            <button onclick={() => { sortField = 'pack'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'pack' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Sample Pack</button>
-                                        </div>
-                                    {/if}
-                                </div>
-                                <div class="h-4 w-px bg-zinc-200 dark:bg-zinc-700 mx-0.5"></div>
-                                <button onclick={() => { sortOrder = sortOrder === 'asc' ? 'desc' : 'asc'; if(sortField !== 'random') { currentPage = 1; loadSamples(); } }} disabled={sortField === 'random'} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer" title="Reverse Order"><ArrowDownUp size={14} class={sortOrder === 'desc' ? 'rotate-180 transition-transform' : 'transition-transform'} /></button>
-                                <button onclick={() => { sortField = 'random'; currentPage = 1; loadSamples(); }} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer {sortField === 'random' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100 shadow-inner' : ''}" title="Shuffle"><Shuffle size={14} /></button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] gap-4 border-y border-zinc-200 py-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:border-zinc-800 items-center px-2">
-                        <div></div><div></div><div></div>
-                        <div>Filename</div><div>Waveform</div><div class="text-right">Time</div><div class="text-center">Key</div><div class="text-center">BPM</div>
-                        <div></div><div></div>
-                    </div>
-
-                    <div class="relative mt-2">
-                        {#if isLoading && samples.length > 0}
-                            <div class="absolute inset-x-0 top-10 z-10 flex justify-center pointer-events-none"><div class="rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-zinc-900 shadow-sm backdrop-blur-md dark:bg-zinc-800/90 dark:text-zinc-100">Filtering...</div></div>
-                        {/if}
-                        {#if isLoading && samples.length === 0}
-                            <div class="flex justify-center items-center h-40 text-sm text-zinc-500 animate-pulse">Loading library...</div>
-                        {:else if samples.length === 0}
-                            <div class="flex flex-col items-center justify-center h-64 text-zinc-500"><span class="text-sm font-medium">No samples found matching these filters.</span><button onclick={clearAllFilters} class="mt-4 text-xs font-semibold text-zinc-900 dark:text-zinc-100 underline cursor-pointer">Clear all filters</button></div>
-                        {:else}
-                            <div class="divide-y divide-zinc-100 dark:divide-zinc-800/50 mb-8 transition-opacity duration-200 {isLoading ? 'opacity-40 pointer-events-none' : 'opacity-100'}">
-                                {#each samples as sample}
-                                    <div id="sample-{sample.id}" class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 rounded-md -mx-2 px-2 {selectedId === sample.id ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/20'}">
-                                        <div class="flex justify-center"><input type="checkbox" checked={appState.selectedSampleIds.includes(sample.id)} onchange={(e) => toggleSampleSelection(sample.id, e.currentTarget.checked)} class="h-4 w-4 rounded border-zinc-300 bg-zinc-100 cursor-pointer accent-zinc-900 dark:accent-zinc-100"></div>
-                                        <div class="h-10 w-10 flex items-center justify-center rounded-md bg-zinc-200/50 text-zinc-400 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50"><ImageIcon size={20} /></div>
-                                        <div class="flex justify-center"><button onclick={() => handlePlayRequest(sample)} class="flex h-8 w-8 items-center justify-center rounded-full bg-zinc-900 text-zinc-100 hover:scale-105 dark:bg-zinc-100 dark:text-zinc-900 transition-transform cursor-pointer shadow-sm">{#if playingId === sample.id} <Pause size={14} /> {:else} <Play size={14} class="ml-0.5" /> {/if}</button></div>
-
-                                        <div class="flex flex-col min-w-0 pr-4 cursor-pointer" role="button" tabindex="0" onclick={() => { selectedId = sample.id; }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') selectedId = sample.id; }}>
-                                            <span class="truncate text-sm font-semibold cursor-pointer hover:underline" title={sample.original_path}>{sample.filename}</span>
-                                            <div class="flex flex-wrap gap-1.5 mt-1 h-4 overflow-hidden">
-                                                {#each parseTags(sample.tags) as tag}
-                                                    <span class="rounded px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider {tag.category === 'Format' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : tag.category === 'Drums' || tag.category === 'Percussion' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : tag.category === 'Genre' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-zinc-200/60 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400'}">{tag.value}</span>
-                                                {/each}
-                                                {#if parseTags(sample.tags).length === 0} <span class="rounded bg-zinc-200/60 px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider text-zinc-400 dark:bg-zinc-800">AUDIO</span> {/if}
+                        <div class="mb-4 flex items-center justify-between text-sm text-zinc-500 relative">
+                            <span>{#if isLoading}Loading...{:else}{totalItems} results{/if}</span>
+                            <div class="flex items-center gap-3">
+                                <span class="text-xs font-medium">Sort by:</span>
+                                <div class="flex items-center rounded-md border border-zinc-200 bg-white p-0.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+                                    <div class="relative">
+                                        <button onclick={(e) => { e.stopPropagation(); isSortDropdownOpen = !isSortDropdownOpen; openDropdown = null; }} class="flex h-7 items-center gap-2 rounded px-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors cursor-pointer">{sortField === 'name' ? 'Alphabetical' : sortField === 'type' ? 'Instrument Type' : sortField === 'pack' ? 'Sample Pack' : 'Randomize'} <ChevronDown size={14} class="opacity-50" /></button>
+                                        {#if isSortDropdownOpen}
+                                            <div onclick={(e) => e.stopPropagation()} class="absolute right-0 top-full mt-1 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                                <button onclick={() => { sortField = 'name'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'name' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Alphabetical</button>
+                                                <button onclick={() => { sortField = 'type'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'type' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Instrument Type</button>
+                                                <button onclick={() => { sortField = 'pack'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'pack' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Sample Pack</button>
                                             </div>
-                                        </div>
-
-                                        <div class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity">
-                                            {#each parseWaveform(sample.waveform_data) as barHeight, i} <div class="w-[3px] rounded-full {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div> {/each}
-                                        </div>
-
-                                        <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
-                                        <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.key_signature || "--"}</div>
-                                        <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.bpm ? Math.round(sample.bpm) : "--"}</div>
-                                        <div class="flex justify-center"><button onclick={(e) => toggleLike(sample, e)} class="transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || sample.is_liked ? 'opacity-100' : 'opacity-0'} {sample.is_liked ? 'text-red-500 hover:text-red-600' : 'text-zinc-400 hover:text-red-500'}"><Heart size={16} class={sample.is_liked ? 'fill-red-500' : ''} /></button></div>
-                                        <div class="relative flex justify-center">
-                                            <button onclick={(e) => { e.stopPropagation(); openContextMenuId = openContextMenuId === sample.id ? null : sample.id; }} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || openContextMenuId === sample.id ? 'opacity-100' : 'opacity-0'}"><EllipsisVertical size={16} /></button>
-                                            {#if openContextMenuId === sample.id}
-                                                <div onclick={(e) => e.stopPropagation()} class="absolute right-full top-0 mr-2 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                                    <button onclick={() => openEditModal(sample)} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Edit Metadata</button>
-                                                    <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
-                                                    <button onclick={() => { invoke('reveal_in_finder', { path: sample.original_path }); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Reveal in Finder</button>
-                                                </div>
-                                            {/if}
-                                        </div>
+                                        {/if}
                                     </div>
-                                {/each}
+                                    <div class="h-4 w-px bg-zinc-200 dark:bg-zinc-700 mx-0.5"></div>
+                                    <button onclick={() => { sortOrder = sortOrder === 'asc' ? 'desc' : 'asc'; if(sortField !== 'random') { currentPage = 1; loadSamples(); } }} disabled={sortField === 'random'} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer" title="Reverse Order"><ArrowDownUp size={14} class={sortOrder === 'desc' ? 'rotate-180 transition-transform' : 'transition-transform'} /></button>
+                                    <button onclick={() => { sortField = 'random'; currentPage = 1; loadSamples(); }} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer {sortField === 'random' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100 shadow-inner' : ''}" title="Shuffle"><Shuffle size={14} /></button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="w-full overflow-x-auto pb-4 no-scrollbar">
+                        <div class="min-w-[760px] pl-8 pr-8">
+
+                            <div class="grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] gap-4 border-y border-zinc-200 py-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:border-zinc-800 items-center -mx-2 px-2">
+                                <div></div><div></div><div></div>
+                                <div>Filename</div><div>Waveform</div><div class="text-right">Time</div><div class="text-center">Key</div><div class="text-center">BPM</div>
+                                <div></div><div></div>
                             </div>
 
-                            {#if totalPages > 1}
-                                <div class="flex items-center justify-center pb-8 pt-4">
-                                    <div class="flex items-center gap-1">
-                                        <button onclick={prevPage} disabled={currentPage === 1} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer mr-2"><ChevronLeft size={18} /></button>
-                                        {#each visiblePages as pageNum} <button onclick={() => goToPage(pageNum)} class="flex items-center justify-center h-8 w-8 rounded text-sm font-medium transition-colors cursor-pointer {pageNum === currentPage ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}">{pageNum}</button> {/each}
-                                        <button onclick={nextPage} disabled={currentPage === totalPages} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer ml-2"><ChevronRight size={18} /></button>
+                            <div class="relative mt-2">
+                                {#if isLoading && samples.length > 0}
+                                    <div class="absolute inset-x-0 top-10 z-10 flex justify-center pointer-events-none"><div class="rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-zinc-900 shadow-sm backdrop-blur-md dark:bg-zinc-800/90 dark:text-zinc-100">Filtering...</div></div>
+                                {/if}
+                                {#if isLoading && samples.length === 0}
+                                    <div class="flex justify-center items-center h-40 text-sm text-zinc-500 animate-pulse">Loading library...</div>
+                                {:else if samples.length === 0}
+                                    <div class="flex flex-col items-center justify-center h-64 text-zinc-500"><span class="text-sm font-medium">No samples found matching these filters.</span><button onclick={clearAllFilters} class="mt-4 text-xs font-semibold text-zinc-900 dark:text-zinc-100 underline cursor-pointer">Clear all filters</button></div>
+                                {:else}
+                                    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/50 mb-8 transition-opacity duration-200 {isLoading ? 'opacity-40 pointer-events-none' : 'opacity-100'}">
+                                        {#each samples as sample}
+                                            <div id="sample-{sample.id}" class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 rounded-md -mx-2 px-2 {selectedId === sample.id ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/20'}">
+                                                <div class="flex justify-center"><input type="checkbox" checked={appState.selectedSampleIds.includes(sample.id)} onchange={(e) => toggleSampleSelection(sample.id, e.currentTarget.checked)} class="h-4 w-4 rounded border-zinc-300 bg-zinc-100 cursor-pointer accent-zinc-900 dark:accent-zinc-100"></div>
+                                                <div class="h-10 w-10 flex items-center justify-center rounded-md bg-zinc-200/50 text-zinc-400 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 overflow-hidden shrink-0">
+                                                    {#if sample.cover_path}
+                                                        <img
+                                                                src={convertFileSrc(sample.cover_path)}
+                                                                alt="Cover"
+                                                                class="h-full w-full object-cover"
+                                                                loading="lazy"
+                                                        />
+                                                    {:else}
+                                                        <ImageIcon size={20} />
+                                                    {/if}
+                                                </div>
+                                                <div class="flex justify-center"><button onclick={() => handlePlayRequest(sample)} class="flex h-8 w-8 items-center justify-center rounded-full bg-zinc-900 text-zinc-100 hover:scale-105 dark:bg-zinc-100 dark:text-zinc-900 transition-transform cursor-pointer shadow-sm">{#if playingId === sample.id} <Pause size={14} /> {:else} <Play size={14} class="ml-0.5" /> {/if}</button></div>
+
+                                                <div class="flex flex-col min-w-0 pr-4 cursor-pointer" role="button" tabindex="0" onclick={() => { selectedId = sample.id; }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') selectedId = sample.id; }}>
+                                                    <span class="truncate text-sm font-semibold cursor-pointer hover:underline" title={sample.original_path}>{sample.filename}</span>
+                                                    <div class="flex flex-wrap gap-1.5 mt-1 h-4 overflow-hidden">
+                                                        {#each parseTags(sample.tags) as tag}
+                                                            <span class="rounded px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider {tag.category === 'Format' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : tag.category === 'Drums' || tag.category === 'Percussion' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : tag.category === 'Genre' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-zinc-200/60 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400'}">{tag.value}</span>
+                                                        {/each}
+                                                        {#if parseTags(sample.tags).length === 0} <span class="rounded bg-zinc-200/60 px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider text-zinc-400 dark:bg-zinc-800">AUDIO</span> {/if}
+                                                    </div>
+                                                </div>
+
+                                                <div class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity">
+                                                    {#each parseWaveform(sample.waveform_data) as barHeight, i} <div class="w-[3px] rounded-full {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div> {/each}
+                                                </div>
+
+                                                <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
+                                                <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.key_signature || "--"}</div>
+                                                <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.bpm ? Math.round(sample.bpm) : "--"}</div>
+                                                <div class="flex justify-center"><button onclick={(e) => toggleLike(sample, e)} class="transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || sample.is_liked ? 'opacity-100' : 'opacity-0'} {sample.is_liked ? 'text-red-500 hover:text-red-600' : 'text-zinc-400 hover:text-red-500'}"><Heart size={16} class={sample.is_liked ? 'fill-red-500' : ''} /></button></div>
+                                                <div class="relative flex justify-center">
+                                                    <button onclick={(e) => { e.stopPropagation(); openContextMenuId = openContextMenuId === sample.id ? null : sample.id; }} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || openContextMenuId === sample.id ? 'opacity-100' : 'opacity-0'}"><EllipsisVertical size={16} /></button>
+                                                    {#if openContextMenuId === sample.id}
+                                                        <div onclick={(e) => e.stopPropagation()} class="absolute right-full top-0 mr-2 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                                            <button onclick={() => openEditModal(sample)} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Edit Metadata</button>
+                                                            <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
+                                                            <button onclick={() => { invoke('reveal_in_finder', { path: sample.original_path }); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Reveal in Finder</button>
+                                                        </div>
+                                                    {/if}
+                                                </div>
+                                            </div>
+                                        {/each}
                                     </div>
-                                </div>
-                            {/if}
-                        {/if}
+                                {/if}
+                            </div>
+                        </div>
                     </div>
+
+                    {#if totalPages > 1}
+                        <div class="w-full">
+                            <div class="flex items-center justify-center pb-8 pt-4">
+                                <div class="flex items-center gap-1">
+                                    <button onclick={prevPage} disabled={currentPage === 1} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer mr-2"><ChevronLeft size={18} /></button>
+                                    {#each visiblePages as pageNum} <button onclick={() => goToPage(pageNum)} class="flex items-center justify-center h-8 w-8 rounded text-sm font-medium transition-colors cursor-pointer {pageNum === currentPage ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}">{pageNum}</button> {/each}
+                                    <button onclick={nextPage} disabled={currentPage === totalPages} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer ml-2"><ChevronRight size={18} /></button>
+                                </div>
+                            </div>
+                        </div>
+                    {/if}
+
                 </div>
             {/if}
         </div>
 
-        <div class="w-72 shrink-0 bg-white/95 backdrop-blur-xl border-l border-zinc-200 dark:border-zinc-800/60 dark:bg-[#18181b]/95 shadow-2xl transition-all duration-300 flex flex-col z-40 {appState.selectedSampleIds.length > 0 ? 'mr-0' : '-mr-72'}">
+        <div class="absolute right-0 top-0 bottom-0 w-72 bg-white/95 backdrop-blur-xl border-l border-zinc-200 dark:border-zinc-800/60 dark:bg-[#18181b]/95 shadow-2xl transition-transform duration-300 flex flex-col z-50 {appState.selectedSampleIds.length > 0 ? 'translate-x-0' : 'translate-x-full'}">
             <div class="flex items-center justify-between px-5 py-4 border-b border-zinc-200 dark:border-zinc-800/60">
                 <span class="font-bold text-sm">{appState.selectedSampleIds.length} Items Selected</span>
                 <button onclick={() => appState.selectedSampleIds = []} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white cursor-pointer"><X size={16} /></button>

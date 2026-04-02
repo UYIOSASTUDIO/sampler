@@ -68,6 +68,11 @@
         systemMedia = window.matchMedia('(prefers-color-scheme: dark)');
         systemMedia.addEventListener('change', applyTheme);
 
+        if (typeof window !== 'undefined') {
+            screenWidth = window.screen.availWidth;
+            windowWidth = window.innerWidth;
+        }
+
         applyTheme();
         await loadCollections();
     });
@@ -79,6 +84,13 @@
     }
 
     let newCollectionName = $state('');
+
+    // --- RESPONSIVE TAB BAR STATE ---
+    let windowWidth = $state(0);
+    let screenWidth = $state(0);
+
+    // Berechnet live, ob das Fenster größer als 75% der Bildschirmbreite ist
+    let showTabLabels = $derived(screenWidth > 0 ? windowWidth > (screenWidth * 0.75) : true);
 
     async function submitCollection() {
         if (!newCollectionName || newCollectionName.trim() === '') return;
@@ -149,6 +161,8 @@
         if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('trigger-sample-reload'));
     }
 </script>
+
+<svelte:window bind:innerWidth={windowWidth} />
 
 <div class="absolute inset-0 flex flex-col overflow-hidden bg-white text-zinc-900 dark:bg-[#121212] dark:text-zinc-100 font-sans antialiased" style="will-change: transform, width, height;">
 
@@ -243,9 +257,18 @@
 
                 <div class="flex items-center gap-6">
                     <div data-tauri-drag-region="false" class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50">
-                        <button onclick={() => appState.currentView = 'sounds'} class="flex items-center gap-2 rounded-md px-4 py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'sounds' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"><Library size={14} /> Sounds</button>
-                        <button onclick={() => appState.currentView = 'projects'} class="flex items-center gap-2 rounded-md px-4 py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'projects' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"><Music size={14} /> Projects</button>
-                        <button onclick={() => appState.currentView = 'editor'} class="flex items-center gap-2 rounded-md px-4 py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'editor' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"><Type size={14} /> Pack Editor</button>
+                        <button onclick={() => appState.currentView = 'sounds'} class="flex items-center justify-center gap-2 rounded-md {showTabLabels ? 'px-4' : 'w-8'} py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'sounds' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">
+                            <Library size={14} class="shrink-0" />
+                            {#if showTabLabels}<span>Sounds</span>{/if}
+                        </button>
+                        <button onclick={() => appState.currentView = 'projects'} class="flex items-center justify-center gap-2 rounded-md {showTabLabels ? 'px-4' : 'w-8'} py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'projects' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">
+                            <Music size={14} class="shrink-0" />
+                            {#if showTabLabels}<span>Projects</span>{/if}
+                        </button>
+                        <button onclick={() => appState.currentView = 'editor'} class="flex items-center justify-center gap-2 rounded-md {showTabLabels ? 'px-4' : 'w-8'} py-1.5 text-xs font-semibold transition-all cursor-pointer {appState.currentView === 'editor' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">
+                            <Type size={14} class="shrink-0" />
+                            {#if showTabLabels}<span>Pack Editor</span>{/if}
+                        </button>
                     </div>
 
                     <div class="h-5 w-px bg-zinc-200 dark:bg-zinc-700 pointer-events-none"></div>

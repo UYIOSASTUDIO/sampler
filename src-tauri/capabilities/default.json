@@ -11,6 +11,7 @@
     "fs:default",
     "core:window:allow-start-dragging",
     "core:window:allow-toggle-maximize",
+    "fs:allow-appdata-read-recursive",
     {
       "identifier": "fs:allow-read",
       "allow": [{ "path": "**" }]

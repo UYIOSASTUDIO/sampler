@@ -8,7 +8,7 @@ mod vault;
 use app::state::AppState;
 use app::commands;
 use std::fs;
-use tauri::Manager;
+use tauri::{Manager, PhysicalSize};
 use rodio::OutputStream;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
@@ -30,8 +30,23 @@ fn main() {
     tauri::Builder::default()
         .manage(audio_state)
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init()) // Aktiviert den direkten File-Stream
+        .plugin(tauri_plugin_fs::init())
         .setup(|app_handle| {
+            // --- NEU: Dynamische Berechnung der minimalen Fenstergröße ---
+            if let Some(window) = app_handle.get_webview_window("main") {
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let screen_size = monitor.size();
+
+                    // Berechnung: 2/3 der Bildschirmbreite und 1/2 der Bildschirmhöhe
+                    let min_width = (screen_size.width as f64 * (2.0 / 3.0)).round() as u32;
+                    let min_height = (screen_size.height as f64 * 0.5).round() as u32;
+
+                    // Setzen der berechneten Werte als ununterschreitbares Minimum
+                    let _ = window.set_min_size(Some(PhysicalSize::new(min_width, min_height)));
+                }
+            }
+            // -------------------------------------------------------------
+
             // 1. Enterprise Logger initialisieren und im Speicher verankern
             let log_guard = app::logger::setup_logging(app_handle);
             app_handle.manage(log_guard);

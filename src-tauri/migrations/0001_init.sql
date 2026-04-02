@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS samples (
                                        lufs_db REAL,
                                        bpm REAL,
                                        bpm_confidence REAL,
+                                       cover_path TEXT,
                                        key_signature TEXT,
                                        key_confidence REAL,
                                        instrument_type TEXT,

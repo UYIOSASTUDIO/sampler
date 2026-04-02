@@ -40,7 +40,7 @@ pub fn start_background_watcher(watch_path: String, pool: SqlitePool, app: AppHa
                     let _ = app.emit("library-updated", ());
                 } else if path.is_file() && scanner::is_supported_audio_file(&path) {
                     tracing::info!("Ghost-Scan: Added {:?}", path.file_name().unwrap_or_default());
-                    scanner::process_single_file(path, pool.clone()).await;
+                    scanner::process_single_file(path, pool.clone(), app.clone()).await;
                     let _ = app.emit("library-updated", ());
                 }
             } else {
