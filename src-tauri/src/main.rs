@@ -103,7 +103,8 @@ fn main() {
             commands::get_waveform,
             commands::play_audio,
             commands::stop_audio,
-            commands::set_audio_volume
+            commands::set_audio_volume,
+            commands::slice_audio
         ])
         .run(tauri::generate_context!())
         .expect("Critical: Error while running tauri application");

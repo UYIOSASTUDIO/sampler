@@ -12,6 +12,11 @@ export const appState = $state({
     // Beeinflusst die Relative-Key-Logik im Pitch-Shifter (z.B. D min → F maj für Major-Samples).
     globalKeyMode: 'min' as 'min' | 'maj',
 
+    // BPM Stretcher — null = off, number = target BPM.
+    // Nur Samples mit bekanntem BPM werden beeinflusst.
+    // Tempo wird via ssstretch ohne Pitch-Änderung angepasst.
+    globalBpm: null as number | null,
+
     isCreateCollectionModalOpen: false,
     themePreference: 'system' as 'light' | 'dark' | 'system',
     isDarkMode: true,

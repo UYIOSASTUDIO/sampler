@@ -3,7 +3,7 @@
     import { onMount } from 'svelte';
     import { appState } from '$lib/store.svelte';
     import { getCurrentWindow } from '@tauri-apps/api/window'; // NEU: Direkte Tauri Window API
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke, convertFileSrc } from '@tauri-apps/api/core';
     import {
         Compass, Folder, Heart, Plus, Search, Play, Pause,
         SkipBack, SkipForward, Volume2, Sun, Moon, Library, Settings,
@@ -324,8 +324,12 @@
         <div class="flex flex-1 items-center justify-center px-4">
             {#if appState.currentSample}
                 <div class="flex items-center gap-4 border border-zinc-200 dark:border-zinc-700/50 rounded-lg p-1.5 px-3 bg-zinc-50 dark:bg-zinc-800/50 shadow-sm min-w-[350px]">
-                    <div class="h-8 w-8 rounded bg-zinc-200 dark:bg-zinc-700 flex items-center justify-center text-zinc-500 dark:text-zinc-400">
-                        <ImageIcon size={16} />
+                    <div class="h-8 w-8 rounded overflow-hidden bg-zinc-200 dark:bg-zinc-700 flex items-center justify-center text-zinc-500 dark:text-zinc-400 shrink-0">
+                        {#if appState.currentSample.cover_path}
+                            <img src={convertFileSrc(appState.currentSample.cover_path)} alt="" class="h-full w-full object-cover" />
+                        {:else}
+                            <ImageIcon size={16} />
+                        {/if}
                     </div>
                     <div class="flex flex-col max-w-[200px] min-w-[150px]">
                         <span class="text-sm font-bold truncate dark:text-zinc-100">{appState.currentSample.filename}</span>

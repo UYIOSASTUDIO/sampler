@@ -10,6 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use lofty::{read_from_path, TaggedFileExt};
 use sha2::{Sha256, Digest};
+use std::io::Read;
 
 use crate::audio::{analyzer, waveform, metadata_parser};
 use crate::vault::taxonomy;
@@ -54,18 +55,18 @@ struct CpuAnalysisResult {
 }
 
 fn fast_fingerprint(path: &Path) -> Result<(String, i64), String> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("metadata error: {}", e))?;
-
+    let meta = std::fs::metadata(path).map_err(|e| format!("metadata error: {}", e))?;
     let size = meta.len() as i64;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
-    let fingerprint = format!("{}-{}", size, mtime);
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open error: {}", e))?;
+    let mut buffer = [0u8; 8192]; // 8 KB Puffer
+    let bytes_read = file.read(&mut buffer).unwrap_or(0);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&buffer[..bytes_read]);
+    hasher.update(size.to_be_bytes()); // Sichert ab, falls zwei Dateien denselben Header haben
+
+    let fingerprint = format!("{:x}", hasher.finalize());
     Ok((fingerprint, size))
 }
 
@@ -113,8 +114,9 @@ fn analyze_file_cpu_heavy(path: &Path, app_data_dir: &Path) -> Result<CpuAnalysi
 
     let (file_hash, file_size) = fast_fingerprint(path)?;
 
-    let waveform_data = waveform::extract_waveform(path, 40).unwrap_or_else(|_| {
-        vec![10; 40]
+    // ENTERPRISE FIX: Höhere Auflösung für detaillierte Editor-Darstellung
+    let waveform_data = waveform::extract_waveform(path, 300).unwrap_or_else(|_| {
+        vec![10; 150]
     });
 
     let (duration_ms, sample_rate, channels, bit_depth) = match analyzer::extract_metadata(path) {

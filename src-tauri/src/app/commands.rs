@@ -639,9 +639,19 @@ const SINK_BUFFER_MAX: usize = 8;
 // CORE PLAYBACK HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Encodes one interleaved slice (direct or pitch-shifted) and appends it to
-/// the Sink.  All mutable buffers are pre-allocated outside the hot loop and
-/// passed by reference to avoid per-chunk heap allocations.
+/// Encodes one interleaved slice (direct, pitch-shifted, or time-stretched) and
+/// appends it to the Sink.  All mutable buffers are pre-allocated outside the
+/// hot loop and passed by reference to avoid per-chunk heap allocations.
+///
+/// `stretch_ratio` is the I/O speed multiplier:
+///   1.0 = no tempo change
+///   1.5 = play 1.5× faster (e.g. 100 BPM → 150 BPM)
+///   0.8 = play 0.8× slower (e.g. 100 BPM → 80 BPM)
+///
+/// This ratio directly controls the output frame count:
+///   output_frames = input_frames / stretch_ratio
+/// ssstretch's `set_transpose_semitones(semitones, Some(speed))` compensates
+/// pitch so that it stays at `semitones` regardless of the speed change.
 #[inline(always)]
 fn flush_chunk(
     interleaved_in:  &[f32],
@@ -649,12 +659,13 @@ fn flush_chunk(
     channels:        usize,
     sample_rate:     u32,
     stretch:         &mut Option<ssstretch::Stretch>,
+    stretch_ratio:   f32,
     in_deint:        &mut Vec<Vec<f32>>,
     out_deint:       &mut Vec<Vec<f32>>,
     sink:            &Arc<Sink>,
 ) {
     if let Some(ref mut s) = stretch {
-        // ── Pitch-shift path ───────────────────────────────────────────────
+        // ── Pitch-shift / time-stretch path ───────────────────────────────
         // Deinterleave: [L,R, L,R, …] → [[L,L,…], [R,R,…]]
         for (fi, frame) in interleaved_in.chunks_exact(channels).take(frames).enumerate() {
             for (ch, &sample) in frame.iter().enumerate() {
@@ -662,18 +673,31 @@ fn flush_chunk(
             }
         }
 
-        s.process_vec(in_deint, frames as i32, out_deint, frames as i32);
+        // The output length drives the actual time-stretch ratio.
+        // output_frames < input_frames → speed up (higher BPM)
+        // output_frames > input_frames → slow down (lower BPM)
+        let output_frames = ((frames as f32) / stretch_ratio).round() as usize;
 
-        // Reinterleave and submit
-        let mut out: Vec<f32> = Vec::with_capacity(frames * channels);
-        for fi in 0..frames {
+        // Grow per-channel output buffers if slowing down requires more frames
+        // than the initial pre-allocation (CHUNK_FRAMES).
+        for ch_buf in out_deint.iter_mut() {
+            if ch_buf.len() < output_frames {
+                ch_buf.resize(output_frames, 0.0);
+            }
+        }
+
+        s.process_vec(in_deint, frames as i32, out_deint, output_frames as i32);
+
+        // Reinterleave output_frames (not input frames) and submit to sink
+        let mut out: Vec<f32> = Vec::with_capacity(output_frames * channels);
+        for fi in 0..output_frames {
             for ch in 0..channels {
                 out.push(out_deint[ch][fi]);
             }
         }
         sink.append(SamplesBuffer::new(channels as u16, sample_rate, out));
     } else {
-        // ── Direct path (no pitch shift) ───────────────────────────────────
+        // ── Direct path (no pitch shift, no stretch) ───────────────────────
         // Copy the interleaved slice directly to the sink — zero extra work.
         sink.append(SamplesBuffer::new(
             channels as u16,
@@ -686,14 +710,15 @@ fn flush_chunk(
 /// Spawns a background thread that:
 /// 1. Opens any audio format via Symphonia (WAV, MP3, FLAC, AIFF, OGG, M4A)
 /// 2. Streams decoded chunks to `sink` without loading the full file into RAM
-/// 3. Optionally applies ssstretch pitch-shifting — skipped entirely at 0 semitones
+/// 3. Optionally applies ssstretch pitch-shifting and/or time-stretching — skipped entirely when not needed
 /// 4. Cancels cleanly when `playback_id` no longer matches `expected_id`
 fn spawn_playback_thread(
-    file_path:   String,
-    semitones:   f32,
-    sink:        Arc<Sink>,
-    playback_id: Arc<AtomicUsize>,
-    expected_id: usize,
+    file_path:     String,
+    semitones:     f32,
+    stretch_ratio: f32,   // 1.0 = no tempo change; target_bpm / sample_bpm otherwise
+    sink:          Arc<Sink>,
+    playback_id:   Arc<AtomicUsize>,
+    expected_id:   usize,
 ) {
     std::thread::spawn(move || {
         // ── 1. Open & probe (format-agnostic) ─────────────────────────────
@@ -754,12 +779,16 @@ fn spawn_playback_thread(
             }
         };
 
-        // ── 2. Pitch-shift setup — only when actually needed ───────────────
-        // Fast-path: semitones ≈ 0.0 → ssstretch is never instantiated.
-        let mut stretch: Option<ssstretch::Stretch> = if semitones.abs() > 0.01 {
+        // ── 2. Pitch-shift / time-stretch setup — only when actually needed ──
+        // Fast-path: both ≈ identity → ssstretch is never instantiated.
+        let need_processing = semitones.abs() > 0.01 || (stretch_ratio - 1.0).abs() > 0.01;
+        let mut stretch: Option<ssstretch::Stretch> = if need_processing {
             let mut s = ssstretch::Stretch::new();
             s.preset_default(channels as i32, sample_rate as f32);
-            s.set_transpose_semitones(semitones, None);
+            // Pass stretch_ratio as the playback speed when BPM stretching is active.
+            // ssstretch handles combined pitch + tempo in a single phase-vocoder pass.
+            let speed = if (stretch_ratio - 1.0).abs() > 0.01 { Some(stretch_ratio) } else { None };
+            s.set_transpose_semitones(semitones, speed);
             Some(s)
         } else {
             None
@@ -777,8 +806,8 @@ fn spawn_playback_thread(
         let mut sym_sample_buf: Option<SymphoniaSampleBuffer<f32>> = None;
 
         tracing::debug!(
-            "play_audio: starting stream '{}' | {}ch | {}Hz | pitch {:+.2} st",
-            file_path, channels, sample_rate, semitones
+            "play_audio: starting stream '{}' | {}ch | {}Hz | pitch {:+.2} st | speed {:.3}x",
+            file_path, channels, sample_rate, semitones, stretch_ratio
         );
 
         // ── 4. Streaming decode + playback loop ────────────────────────────
@@ -803,6 +832,7 @@ fn spawn_playback_thread(
                     channels,
                     sample_rate,
                     &mut stretch,
+                    stretch_ratio,
                     &mut in_deint,
                     &mut out_deint,
                     &sink,
@@ -824,6 +854,7 @@ fn spawn_playback_thread(
                             channels,
                             sample_rate,
                             &mut stretch,
+                            stretch_ratio,
                             &mut in_deint,
                             &mut out_deint,
                             &sink,
@@ -863,10 +894,11 @@ fn spawn_playback_thread(
 
 #[tauri::command]
 pub fn play_audio(
-    file_path: String,
-    semitones:  f32,
-    volume:     f32,
-    state:      State<'_, AudioState>,
+    file_path:     String,
+    semitones:     f32,
+    stretch_ratio: f32,   // 1.0 = no BPM stretch; target_bpm / sample_bpm otherwise
+    volume:        f32,
+    state:         State<'_, AudioState>,
 ) -> Result<(), String> {
     // Atomically increment playback ID — this cancels any running thread
     let new_id = state.playback_id.fetch_add(1, Ordering::SeqCst) + 1;
@@ -888,6 +920,7 @@ pub fn play_audio(
     spawn_playback_thread(
         file_path,
         semitones,
+        stretch_ratio,
         sink,
         state.playback_id.clone(),
         new_id,
@@ -911,4 +944,63 @@ pub fn set_audio_volume(volume: f32, state: State<'_, AudioState>) {
     if let Some(sink) = state.current_sink.lock().unwrap().as_ref() {
         sink.set_volume(volume);
     }
+}
+
+use hound::{WavReader, WavWriter, SampleFormat};
+use uuid::Uuid;
+
+#[tauri::command]
+pub async fn slice_audio(path: String, start_ms: f64, end_ms: f64) -> Result<String, String> {
+    if !path.to_lowercase().ends_with(".wav") {
+        return Ok(path);
+    }
+
+    let mut reader = WavReader::open(&path).map_err(|e| format!("Failed to open WAV: {}", e))?;
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate as f64;
+    let channels = spec.channels as u32;
+
+    let start_sample = ((start_ms / 1000.0) * sample_rate) as u32;
+    let end_sample = ((end_ms / 1000.0) * sample_rate) as u32;
+
+    let temp_dir = std::env::temp_dir();
+    let out_path = temp_dir.join(format!("samplevault_slice_{}.wav", Uuid::new_v4()));
+
+    let mut writer = WavWriter::create(&out_path, spec).map_err(|e| e.to_string())?;
+
+    // ENTERPRISE FIX: O(1) Seek! Überspringt Millionen von Samples in absoluter Nullzeit.
+    reader.seek(start_sample).map_err(|e| format!("Seek error: {}", e))?;
+
+    let duration_samples = end_sample.saturating_sub(start_sample);
+    let total_samples_to_read = duration_samples * channels;
+    let mut samples_read = 0;
+
+    // Hochperformantes Herauskopieren exakt der markierten Daten (Int oder Float)
+    match spec.sample_format {
+        SampleFormat::Int => {
+            if spec.bits_per_sample <= 16 {
+                for s in reader.samples::<i16>() {
+                    if samples_read >= total_samples_to_read { break; }
+                    writer.write_sample(s.unwrap_or(0)).ok();
+                    samples_read += 1;
+                }
+            } else {
+                for s in reader.samples::<i32>() {
+                    if samples_read >= total_samples_to_read { break; }
+                    writer.write_sample(s.unwrap_or(0)).ok();
+                    samples_read += 1;
+                }
+            }
+        },
+        SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                if samples_read >= total_samples_to_read { break; }
+                writer.write_sample(s.unwrap_or(0.0)).ok();
+                samples_read += 1;
+            }
+        }
+    }
+
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(out_path.to_string_lossy().to_string())
 }

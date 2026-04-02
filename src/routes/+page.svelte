@@ -6,7 +6,7 @@
     import { appDataDir } from '@tauri-apps/api/path';
     import { open } from '@tauri-apps/plugin-dialog';
     import { writeFile, mkdir } from '@tauri-apps/plugin-fs';
-    import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus, Music2 } from 'lucide-svelte';
+    import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus, Music2, Repeat, Gauge } from 'lucide-svelte';
     import { appState } from '$lib/store.svelte';
     import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
@@ -83,6 +83,9 @@
 
     let playbackProgress: number = $state(0);
     let currentSampleDuration: number = 0;
+    // Captured at playback start — actual duration = currentSampleDuration / currentStretchRatio.
+    // Keeps animation in sync with the time-stretched audio.
+    let currentStretchRatio: number = 1.0;
     let playbackStartTime: number = 0;
     let animationFrameId: number;
 
@@ -111,21 +114,58 @@
     let scanPercentage = $derived(scanTotal > 0 ? Math.round((scanCurrent / scanTotal) * 100) : 0);
 
     function updateProgress() {
-        if (appState.isPlaying && currentSampleDuration > 0) {
+        if (appState.isPlaying) {
             const elapsed = (performance.now() - playbackStartTime) / 1000;
-            let progress = elapsed / currentSampleDuration;
 
-            if (progress >= 1.0) {
-                appState.playbackProgress = 1.0;
-                playbackProgress = 1.0;
-                appState.isPlaying = false;
-                playingId = null;
-                cancelAnimationFrame(animationFrameId);
-                setTimeout(() => { if (!appState.isPlaying) appState.playbackProgress = 0; }, 150);
+            if (isSamplerOpen && samplerSample) {
+                // Svelte simuliert den Schnitt in Echtzeit anhand der aktuellen Regler.
+                // Division durch currentStretchRatio gleicht die BPM-gestreckte Laufzeit aus.
+                const selectionDurationSec = (samplerSample.duration_ms * (trimEndPct - trimStartPct)) / 1000 / currentStretchRatio;
+
+                // Wenn du den End-Regler kürzer ziehst, feuert das hier sofort und loopt neu!
+                // Wenn du ihn länger ziehst, läuft das Audio einfach ungestört weiter.
+                if (elapsed >= selectionDurationSec) {
+                    if (isLooping && currentPreviewPath) {
+                        playbackStartTime = performance.now();
+                        appState.playbackProgress = 0;
+                        // Re-capture ratio on each loop iteration in case globalBpm changed
+                        currentStretchRatio = samplerSample ? getStretchRatio(samplerSample) : 1.0;
+
+                        let semitones = 0;
+                        if (appState.globalKey && samplerSample.key_signature) {
+                            semitones = getSemitoneShift(samplerSample.key_signature, appState.globalKey, appState.globalKeyMode);
+                        }
+                        // Zwingt Rust, sofort und ohne Latenz wieder bei Sekunde 0 der Datei zu starten
+                        invoke('play_audio', { filePath: currentPreviewPath, semitones, stretchRatio: currentStretchRatio, volume: appState.globalVolume }).catch(console.error);
+                        animationFrameId = requestAnimationFrame(updateProgress);
+                    } else {
+                        appState.playbackProgress = 1.0;
+                        appState.isPlaying = false;
+                        playingId = null;
+                        invoke('stop_audio').catch(console.error);
+                        cancelAnimationFrame(animationFrameId);
+                        setTimeout(() => { if (!appState.isPlaying) appState.playbackProgress = 0; }, 150);
+                    }
+                } else {
+                    appState.playbackProgress = elapsed / selectionDurationSec;
+                    animationFrameId = requestAnimationFrame(updateProgress);
+                }
             } else {
-                appState.playbackProgress = progress;
-                playbackProgress = progress;
-                animationFrameId = requestAnimationFrame(updateProgress);
+                // Normale Listen-Ansicht
+                // Effektive Dauer = original / stretchRatio (kürzer bei Speedup, länger bei Slowdown)
+                if (currentSampleDuration > 0) {
+                    let progress = elapsed / (currentSampleDuration / currentStretchRatio);
+                    if (progress >= 1.0) {
+                        appState.playbackProgress = 1.0;
+                        appState.isPlaying = false;
+                        playingId = null;
+                        cancelAnimationFrame(animationFrameId);
+                        setTimeout(() => { if (!appState.isPlaying) appState.playbackProgress = 0; }, 150);
+                    } else {
+                        appState.playbackProgress = progress;
+                        animationFrameId = requestAnimationFrame(updateProgress);
+                    }
+                }
             }
         }
     }
@@ -167,6 +207,8 @@
         window.addEventListener('keydown', handleKeydown);
         window.addEventListener('click', handleGlobalClick);
         window.addEventListener('trigger-sample-reload', handleSampleReload);
+        window.addEventListener('mousemove', handleEditorMouseMove);
+        window.addEventListener('mouseup', handleEditorMouseUp);
 
         try {
             await invoke<number>('cleanup_database');
@@ -187,6 +229,8 @@
         window.removeEventListener('keydown', handleKeydown);
         window.removeEventListener('click', handleGlobalClick);
         window.removeEventListener('trigger-sample-reload', handleSampleReload);
+        window.removeEventListener('mousemove', handleEditorMouseMove);
+        window.removeEventListener('mouseup', handleEditorMouseUp);
     });
 
     $effect(() => {
@@ -235,9 +279,16 @@
     $effect(() => {
         if (appState.cmdTogglePlay > lastToggle) {
             lastToggle = appState.cmdTogglePlay;
+
+            // ENTERPRISE FIX: Wenn Sampler offen, ignoriere die normale Liste und toggle das Preview!
+            if (isSamplerOpen) {
+                playSlicePreview();
+                return;
+            }
+
             if (appState.currentSample) {
                 if (appState.isPlaying) {
-                    if (sourceNode) { sourceNode.onended = null; sourceNode.stop(); }
+                    invoke('stop_audio').catch(e => console.error(e));
                     appState.isPlaying = false; playingId = null; cancelAnimationFrame(animationFrameId);
                 } else {
                     handlePlayRequest(appState.currentSample, true);
@@ -360,7 +411,37 @@
     }
 
     async function handleKeydown(e: KeyboardEvent) {
+        // Ignoriere Tastenkürzel, wenn der Nutzer in einem Suchfeld tippt
         if (document.activeElement?.tagName === 'INPUT') return;
+
+        if (isSamplerOpen) {
+            // ArrowLeft ignoriert das Blockieren und wird zum Retrigger!
+            if (['ArrowDown', 'ArrowUp', 'ArrowRight'].includes(e.key)) {
+                e.preventDefault();
+                return;
+            }
+
+            // ENTERPRISE FIX: ArrowLeft fungiert als MPC "CUE"-Trigger.
+            // Es startet das Preview in 0ms komplett von vorn, egal ob es gerade läuft!
+            if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                playSlicePreview(true);
+                return;
+            }
+
+            if (e.key === ' ') {
+                e.preventDefault();
+                playSlicePreview();
+                return;
+            }
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                closeSampler();
+                return;
+            }
+            return;
+        }
+
         if (isLoading) {
             if (['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
             return;
@@ -379,7 +460,7 @@
                         if (samples.length > 0) {
                             await handlePlayRequest(samples[0]);
                             await tick();
-                            scrollToSample(samples[0].id); // GEÄNDERT
+                            scrollToSample(samples[0].id);
                         }
                     }
                     return;
@@ -392,7 +473,7 @@
                         if (samples.length > 0) {
                             await handlePlayRequest(samples[samples.length - 1]);
                             await tick();
-                            scrollToSample(samples[samples.length - 1].id); // GEÄNDERT
+                            scrollToSample(samples[samples.length - 1].id);
                         }
                     }
                     return;
@@ -402,7 +483,7 @@
             const nextSample = samples[currentIndex];
             handlePlayRequest(nextSample);
             await tick();
-            scrollToSample(nextSample.id); // GEÄNDERT
+            scrollToSample(nextSample.id);
 
         } else if (e.key === 'ArrowLeft') {
             e.preventDefault();
@@ -523,12 +604,19 @@
             semitones = getSemitoneShift(sample.key_signature, appState.globalKey, appState.globalKeyMode);
         }
 
+        // BPM Stretcher: time-stretch sample to globalBpm without changing pitch.
+        // Ratio 1.0 = identity (ssstretch fast-path, no processing overhead).
+        const stretchRatio = getStretchRatio(sample);
+
         currentSampleDuration = sample.duration_ms / 1000; // Umrechnung in Sekunden
+        // Capture stretch ratio so updateProgress can animate against the real duration.
+        currentStretchRatio = stretchRatio;
 
         try {
             await invoke('play_audio', {
                 filePath: sample.original_path,
                 semitones: semitones,
+                stretchRatio: stretchRatio,
                 volume: appState.globalVolume
             });
 
@@ -545,7 +633,19 @@
     function nextPage() { if (currentPage < totalPages) { currentPage++; loadSamples(); } }
     function prevPage() { if (currentPage > 1) { currentPage--; loadSamples(); } }
     function toggleFilter(type: string) { activeTypeFilter = activeTypeFilter === type ? null : type; currentPage = 1; loadSamples(); }
-    function parseWaveform(data: number[] | null): number[] { return (!data || data.length === 0) ? Array(40).fill(10) : data; }
+    // ENTERPRISE FIX: Intelligentes Waveform-Downsampling
+    function parseWaveform(data: number[] | null, targetLength: number = 40): number[] {
+        if (!data || data.length === 0) return Array(targetLength).fill(10);
+        if (data.length === targetLength) return data;
+
+        const result = [];
+        const step = data.length / targetLength;
+        for (let i = 0; i < targetLength; i++) {
+            const idx = Math.floor(i * step);
+            result.push(data[Math.min(idx, data.length - 1)] || 10);
+        }
+        return result;
+    }
 
     async function handleSelectFolder() {
         try {
@@ -560,7 +660,14 @@
         scanMessage = 'Indexing...';
         try {
             const count = await invoke<number>('scan_library', { path: selectedPath });
-            scanMessage = `Added ${count} files.`;
+            const skipped = scanTotal - count;
+
+            if (skipped > 0) {
+                scanMessage = `Added ${count} files (${skipped} duplicates skipped).`;
+            } else {
+                scanMessage = `Added ${count} files.`;
+            }
+
             selectedPath = null;
             currentPage = 1;
             await loadSamples();
@@ -607,7 +714,7 @@
 
     // --- FILTER UI STATE ---
     // 'globalkey' ist das Piano-Dropdown für den globalen Pitch-Key im Player-Header
-    let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | null = $state(null);
+    let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | 'globalbpm' | null = $state(null);
 
     // Absoluter Pfad zum appDataDir — wird in onMount aufgelöst.
     // Drag-Icons werden dort als 64×64 PNGs gecacht.
@@ -674,6 +781,19 @@
             ? `${appState.globalKey} ${appState.globalKeyMode}`
             : 'Off'
     );
+    // ─── BPM STRETCHER ───────────────────────────────────────────────────────────
+    // Returns the playback speed ratio needed to hit the global BPM target.
+    // Returns 1.0 when the sample has no BPM data or globalBpm is off.
+    function getStretchRatio(sample: SampleRecord): number {
+        if (!appState.globalBpm || !sample.bpm || sample.bpm <= 0) return 1.0;
+        return appState.globalBpm / sample.bpm;
+    }
+
+    // Lesbarer Label für den BPM Trigger-Button: "120 BPM" oder "BPM"
+    let globalBpmLabel = $derived(
+        appState.globalBpm ? `${appState.globalBpm} BPM` : 'BPM'
+    );
+
     function toggleTagMatchMode() { appState.filters.tagMatchMode = appState.filters.tagMatchMode === 'AND' ? 'OR' : 'AND'; currentPage = 1; loadSamples(); }
 
     let isTagsExpanded: boolean = $state(false);
@@ -686,7 +806,7 @@
         });
     });
 
-    function toggleDropdown(dropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey', event: Event) {
+    function toggleDropdown(dropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | 'globalbpm', event: Event) {
         event.stopPropagation();
         openDropdown = openDropdown === dropdown ? null : dropdown;
     }
@@ -1006,6 +1126,224 @@
             }
         };
     }
+
+    // --- SAMPLER & TRIMMER STATE ---
+    let isSamplerOpen = $state(false);
+    let samplerSample: SampleRecord | null = $state(null);
+
+    // Wir trennen strikt zwischen Preview (immer bis 100% Länge) und Export (genau geschnitten)
+    let currentPreviewPath: string | null = $state(null);
+    let exportSlicedPath: string | null = $state(null);
+    let previewSliceStartPct = $state(0);
+
+    let isSlicing = $state(false);
+    let isSliceReady = $state(false);
+    let isLooping = $state(false);
+
+    let trimStartPct = $state(0);
+    let trimEndPct = $state(1);
+    let isDraggingHandle: 'start' | 'end' | null = $state(null);
+    let editorWaveformContainer: HTMLDivElement;
+
+    function openSampler(sample: SampleRecord) {
+        if (appState.isPlaying) {
+            invoke('stop_audio').catch(console.error);
+            appState.isPlaying = false;
+            playingId = null;
+            cancelAnimationFrame(animationFrameId);
+        }
+
+        samplerSample = sample;
+        isSamplerOpen = true;
+        isSliceReady = false;
+        trimStartPct = 0;
+        trimEndPct = 1;
+        currentPreviewPath = null;
+        exportSlicedPath = null;
+    }
+
+    function closeSampler() {
+        if (appState.isPlaying) {
+            invoke('stop_audio').catch(console.error);
+            appState.isPlaying = false;
+            playingId = null;
+            cancelAnimationFrame(animationFrameId);
+        }
+
+        isSamplerOpen = false;
+        samplerSample = null;
+        currentPreviewPath = null;
+        exportSlicedPath = null;
+        isSliceReady = false;
+    }
+
+    async function confirmSlice() {
+        if (!samplerSample) return;
+        isSlicing = true;
+        try {
+            // ENTERPRISE FIX: Für den Export (Drag & Drop) schneiden wir exakt!
+            const startMs = trimStartPct * samplerSample.duration_ms;
+            const endMs = trimEndPct * samplerSample.duration_ms;
+            exportSlicedPath = await invoke<string>('slice_audio', {
+                path: samplerSample.original_path,
+                startMs: startMs,
+                endMs: endMs
+            });
+            isSliceReady = true;
+        } catch (e) {
+            console.error("Failed to slice audio:", e);
+        } finally {
+            isSlicing = false;
+        }
+    }
+
+    function editSlice() {
+        isSliceReady = false;
+        exportSlicedPath = null;
+    }
+
+    // ENTERPRISE PREVIEW: Generiert immer bis 100% Datei-Ende, um Stille beim Ziehen zu verhindern!
+    async function playSlicePreview(forceRestart = false) {
+        if (!samplerSample) return;
+
+        if (appState.isPlaying && !forceRestart) {
+            invoke('stop_audio').catch(console.error);
+            appState.isPlaying = false;
+            cancelAnimationFrame(animationFrameId);
+            return;
+        }
+
+        if (isSlicing && !currentPreviewPath) return;
+
+        // Neu berechnen, wenn noch kein File da ist, ODER der Startpunkt verschoben wurde
+        if (!isSliceReady && (!currentPreviewPath || previewSliceStartPct !== trimStartPct)) {
+            isSlicing = true;
+            try {
+                const startMs = trimStartPct * samplerSample.duration_ms;
+                const endMs = samplerSample.duration_ms; // IMMER BIS ZUM ABSOLUTEN ENDE!
+                currentPreviewPath = await invoke<string>('slice_audio', {
+                    path: samplerSample.original_path,
+                    startMs: startMs,
+                    endMs: endMs
+                });
+                previewSliceStartPct = trimStartPct;
+            } catch (e) {
+                console.error("Preview error:", e);
+                return;
+            } finally {
+                isSlicing = false;
+            }
+        }
+
+        if (currentPreviewPath) {
+            let semitones = 0;
+            if (appState.globalKey && samplerSample.key_signature) {
+                semitones = getSemitoneShift(samplerSample.key_signature, appState.globalKey, appState.globalKeyMode);
+            }
+
+            try {
+                if (appState.isPlaying) await invoke('stop_audio');
+                await invoke('play_audio', {
+                    filePath: currentPreviewPath,
+                    semitones: semitones,
+                    stretchRatio: getStretchRatio(samplerSample),
+                    volume: appState.globalVolume
+                });
+                appState.isPlaying = true;
+                playbackStartTime = performance.now();
+                animationFrameId = requestAnimationFrame(updateProgress);
+            } catch (error) {
+                console.error(error);
+            }
+        }
+    }
+
+    function handleEditorMouseMove(e: MouseEvent) {
+        if (!isDraggingHandle || !editorWaveformContainer || isSliceReady) return;
+        const rect = editorWaveformContainer.getBoundingClientRect();
+        let pct = (e.clientX - rect.left) / rect.width;
+        pct = Math.max(0, Math.min(1, pct));
+
+        if (isDraggingHandle === 'start') {
+            trimStartPct = Math.min(pct, trimEndPct - 0.02);
+            currentPreviewPath = null; // Zerstört den Cache nur, wenn der Start verschoben wird
+        } else {
+            trimEndPct = Math.max(pct, trimStartPct + 0.02);
+            // End-Änderungen lassen das laufende Audio völlig unangetastet!
+        }
+    }
+
+    function handleEditorMouseUp() {
+        if (isDraggingHandle) {
+            const wasStart = isDraggingHandle === 'start';
+            isDraggingHandle = null;
+            // Triggert einen neuen Schnitt/Neustart NUR, wenn der linke Start-Regler angefasst wurde.
+            // Der rechte Regler ist ab sofort zu 100% dynamisch über die Engine gesteuert!
+            if (wasStart && appState.isPlaying && !isSliceReady) {
+                playSlicePreview(true);
+            }
+        }
+    }
+
+    // --- ENTERPRISE INSTANT SLICE DRAG ---
+    function nativeSliceDrag(node: HTMLElement) {
+        let startX = 0;
+        let startY = 0;
+        let isDragging = false;
+        let didDrag = false;
+
+        const handleMouseMove = async (e: MouseEvent) => {
+            // Drag ist NUR erlaubt, wenn der Nutzer auf "Confirm Selection" gedrückt hat!
+            if (isDragging || !isSliceReady || !exportSlicedPath || !samplerSample) return;
+
+            const dx = Math.abs(e.clientX - startX);
+            const dy = Math.abs(e.clientY - startY);
+
+            if (dx > 5 || dy > 5) {
+                isDragging = true;
+                cleanupWindowListeners();
+
+                try {
+                    const icon = await prepareDragIcon(samplerSample).catch(() => '');
+                    await startDrag({ item: [exportSlicedPath], icon });
+                    didDrag = true;
+                } catch (err) {
+                    console.error("Slice & Drag Error:", err);
+                } finally {
+                    isDragging = false;
+                }
+            }
+        };
+
+        const handleMouseUp = () => cleanupWindowListeners();
+        const handleClick = (e: MouseEvent) => { if (didDrag) { e.stopPropagation(); e.preventDefault(); didDrag = false; } };
+        const cleanupWindowListeners = () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+
+        const handleMouseDown = (e: MouseEvent) => {
+            if (e.button !== 0 || !isSliceReady) return;
+            e.preventDefault();
+            startX = e.clientX;
+            startY = e.clientY;
+            isDragging = false;
+            didDrag = false;
+            window.addEventListener('mousemove', handleMouseMove);
+            window.addEventListener('mouseup', handleMouseUp);
+        };
+
+        node.addEventListener('mousedown', handleMouseDown);
+        node.addEventListener('click', handleClick);
+
+        return {
+            destroy() {
+                node.removeEventListener('mousedown', handleMouseDown);
+                node.removeEventListener('click', handleClick);
+                cleanupWindowListeners();
+            }
+        };
+    }
 </script>
 
 {#if appState.currentView === 'sounds'}
@@ -1244,6 +1582,101 @@
                                     {/if}
                                 </div>
 
+                                <!-- BPM Pill Divider -->
+                                <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
+
+                                <!-- ── BPM Stretcher Pill ── -->
+                                <div class="relative shrink-0">
+                                    <button
+                                            onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalbpm' ? null : 'globalbpm'; }}
+                                            class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
+                                               {appState.globalBpm
+                                                   ? 'border-violet-500 bg-violet-500 text-white shadow-sm shadow-violet-500/30 dark:shadow-violet-500/20'
+                                                   : 'border-violet-500/40 bg-violet-50 text-violet-700 hover:border-violet-500 hover:bg-violet-100 dark:border-violet-500/20 dark:bg-violet-500/5 dark:text-violet-400 dark:hover:border-violet-500/50 dark:hover:bg-violet-500/10'}"
+                                    >
+                                        <Gauge size={13} class="shrink-0 {appState.globalBpm ? 'opacity-100' : 'opacity-70'}" />
+                                        <span>{globalBpmLabel}</span>
+                                        {#if !appState.globalBpm}
+                                            <ChevronDown size={12} class="opacity-50" />
+                                        {:else}
+                                            <span class="relative flex h-1.5 w-1.5 shrink-0">
+                                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
+                                            </span>
+                                        {/if}
+                                    </button>
+
+                                    {#if openDropdown === 'globalbpm'}
+                                        <div
+                                                onclick={(e) => e.stopPropagation()}
+                                                class="absolute left-0 top-full mt-2 w-64 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-700/60 dark:bg-[#18181b] z-50 flex"
+                                        >
+                                            <!-- Header -->
+                                            <div class="flex items-center gap-2 border-b border-zinc-100 pb-2.5 dark:border-zinc-800">
+                                                <Gauge size={13} class="text-violet-500 shrink-0" />
+                                                <span class="text-xs font-bold text-zinc-700 dark:text-zinc-200">BPM Stretcher</span>
+                                            </div>
+
+                                            <!-- BPM Input with +/- controls -->
+                                            <div class="flex items-center gap-2">
+                                                <button
+                                                        onclick={() => { if (appState.globalBpm && appState.globalBpm > 1) appState.globalBpm = Math.max(1, appState.globalBpm - 1); }}
+                                                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-sm font-bold text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors cursor-pointer select-none"
+                                                >−</button>
+                                                <input
+                                                        type="number"
+                                                        min="1"
+                                                        max="300"
+                                                        placeholder="e.g. 120"
+                                                        value={appState.globalBpm ?? ''}
+                                                        oninput={(e) => {
+                                                            const v = parseInt((e.target as HTMLInputElement).value);
+                                                            appState.globalBpm = (!isNaN(v) && v > 0) ? v : null;
+                                                        }}
+                                                        class="h-8 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-center text-sm font-bold text-zinc-900 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500/30 dark:border-zinc-700 dark:bg-zinc-800 dark:text-white dark:focus:border-violet-500 transition-colors"
+                                                />
+                                                <button
+                                                        onclick={() => { appState.globalBpm = (appState.globalBpm ?? 119) + 1; }}
+                                                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-sm font-bold text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors cursor-pointer select-none"
+                                                >+</button>
+                                            </div>
+
+                                            <!-- Common BPM presets -->
+                                            <div>
+                                                <p class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Presets</p>
+                                                <div class="grid grid-cols-5 gap-1">
+                                                    {#each [80, 90, 100, 110, 120, 128, 140, 150, 160, 174] as preset}
+                                                        <button
+                                                                onclick={() => { appState.globalBpm = preset; }}
+                                                                class="rounded-md py-1.5 text-xs font-semibold transition-colors cursor-pointer
+                                                                   {appState.globalBpm === preset
+                                                                       ? 'bg-violet-500 text-white shadow-sm'
+                                                                       : 'bg-zinc-100 text-zinc-600 hover:bg-violet-50 hover:text-violet-700 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-violet-500/10 dark:hover:text-violet-300'}"
+                                                        >{preset}</button>
+                                                    {/each}
+                                                </div>
+                                            </div>
+
+                                            <!-- Hint -->
+                                            {#if appState.globalBpm}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Samples mit bekanntem BPM werden auf <span class="font-semibold text-violet-600 dark:text-violet-400">{appState.globalBpm} BPM</span> gestreckt — ohne Pitch-Änderung.
+                                                </p>
+                                            {:else}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Wähle ein Ziel-BPM. Nur Samples mit bekanntem BPM werden beeinflusst.
+                                                </p>
+                                            {/if}
+
+                                            <!-- Turn Off -->
+                                            <button
+                                                    onclick={() => { appState.globalBpm = null; openDropdown = null; }}
+                                                    class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
+                                            >Turn Off</button>
+                                        </div>
+                                    {/if}
+                                </div>
+
                                 <div class="ml-auto flex items-center gap-2">
                                     <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Match:</span>
                                     <div class="flex h-8 rounded-full border border-zinc-200 bg-zinc-50 p-[3px] dark:border-zinc-700/50 dark:bg-zinc-900">
@@ -1350,7 +1783,7 @@
                                                         class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing"
                                                 >
                                                     {#each parseWaveform(sample.waveform_data) as barHeight, i}
-                                                        <div class="w-[3px] rounded-full pointer-events-none {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div>
+                                                        <div class="w-[3px] rounded-full pointer-events-none {playingId === sample.id && (i / 40) <= appState.playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div>
                                                     {/each}
                                                 </div>
                                                 <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
@@ -1361,6 +1794,8 @@
                                                     <button onclick={(e) => { e.stopPropagation(); openContextMenuId = openContextMenuId === sample.id ? null : sample.id; }} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || openContextMenuId === sample.id ? 'opacity-100' : 'opacity-0'}"><EllipsisVertical size={16} /></button>
                                                     {#if openContextMenuId === sample.id}
                                                         <div onclick={(e) => e.stopPropagation()} class="absolute right-full top-0 mr-2 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                                            <button onclick={() => { openSampler(sample); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/30 cursor-pointer transition-colors">Open in Sampler</button>
+                                                            <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
                                                             <button onclick={() => openEditModal(sample)} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Edit Metadata</button>
                                                             <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
                                                             <button onclick={() => { invoke('reveal_in_finder', { path: sample.original_path }); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Reveal in Finder</button>
@@ -1418,7 +1853,8 @@
 {:else if appState.currentView === 'projects'}
     <div class="flex h-full items-center justify-center text-zinc-500"><h2 class="text-2xl font-bold">Musik Projekte (Coming Soon)</h2></div>
 {:else if appState.currentView === 'editor'}
-    <div class="flex h-full items-center justify-center text-zinc-500"><h2 class="text-2xl font-bold">Pack Editor & Renamer (Coming Soon)</h2></div>
+    <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8">
+    </div>
 {:else if appState.currentView === 'settings'}
     <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8">
         <h1 class="mb-8 text-3xl font-bold tracking-tight">Preferences</h1>
@@ -1546,6 +1982,127 @@
             <div class="mt-8 flex justify-end gap-3">
                 <button onclick={() => editingSample = null} class="px-4 py-2 text-sm font-semibold text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors cursor-pointer">Cancel</button>
                 <button onclick={saveMetadata} class="rounded-md bg-zinc-900 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white transition-colors cursor-pointer">Save Changes</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if isSamplerOpen && samplerSample}
+    <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200 p-8">
+        <div class="w-full max-w-5xl bg-white dark:bg-[#18181b] border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+
+            <div class="flex items-center justify-between px-6 py-4 border-b border-zinc-100 dark:border-zinc-800/50 bg-zinc-50/50 dark:bg-zinc-900/50">
+                <div class="flex items-center gap-4">
+                    <div class="h-12 w-12 flex items-center justify-center rounded-md bg-zinc-200 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 overflow-hidden shrink-0 shadow-sm">
+                        {#if samplerSample.cover_path}
+                            <img src={convertFileSrc(samplerSample.cover_path)} alt="Cover" class="h-full w-full object-cover" />
+                        {:else}
+                            <ImageIcon size={20} class="text-zinc-400" />
+                        {/if}
+                    </div>
+                    <div>
+                        <h2 class="text-lg font-bold text-zinc-900 dark:text-white leading-none">{samplerSample.filename}</h2>
+                        <div class="flex items-center gap-2 mt-2 text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">
+                            <span class="bg-zinc-200/60 dark:bg-zinc-800 px-1.5 py-[2px] rounded text-zinc-700 dark:text-zinc-300">{samplerSample.extension}</span>
+                            <span>{formatDuration(samplerSample.duration_ms)}</span>
+                            {#if samplerSample.bpm}<span>• {Math.round(samplerSample.bpm)} BPM</span>{/if}
+                            {#if samplerSample.key_signature}<span>• {samplerSample.key_signature}</span>{/if}
+                        </div>
+                    </div>
+                </div>
+                <button onclick={closeSampler} class="h-8 w-8 flex items-center justify-center rounded-full text-zinc-400 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-white transition-colors cursor-pointer">
+                    <X size={20} />
+                </button>
+            </div>
+
+            <div class="p-6 pb-8">
+                <div class="flex justify-between mb-3 text-[11px] font-bold uppercase tracking-wider text-zinc-400 tabular-nums px-1">
+                    <span>Start: {formatDuration(samplerSample.duration_ms * trimStartPct)}</span>
+                    <span class="text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-800/50">
+                        Selection Length: {formatDuration(samplerSample.duration_ms * (trimEndPct - trimStartPct))}
+                    </span>
+                    <span>End: {formatDuration(samplerSample.duration_ms * trimEndPct)}</span>
+                </div>
+
+                <div
+                        bind:this={editorWaveformContainer}
+                        class="relative w-full h-48 bg-zinc-100 dark:bg-[#121214] border border-zinc-200 dark:border-zinc-800 rounded-xl overflow-hidden select-none shadow-inner"
+                >
+                    <div class="absolute inset-0 flex items-center justify-between gap-[1px] opacity-20 pointer-events-none">
+                        {#each parseWaveform(samplerSample.waveform_data, 300) as barHeight}
+                            <div class="w-full rounded-full bg-zinc-500" style="height: {barHeight}%;"></div>
+                        {/each}
+                    </div>
+
+                    <div
+                            class="absolute inset-0 flex items-center justify-between gap-[1px] pointer-events-none"
+                            style="clip-path: polygon({trimStartPct * 100}% 0, {trimEndPct * 100}% 0, {trimEndPct * 100}% 100%, {trimStartPct * 100}% 100%);"
+                    >
+                        {#each parseWaveform(samplerSample.waveform_data, 300) as barHeight}
+                            <div class="w-full rounded-full {isSliceReady ? 'bg-emerald-400' : 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]'} transition-colors" style="height: {barHeight}%;"></div>
+                        {/each}
+                    </div>
+
+                    <div
+                            class="absolute top-0 bottom-0 {isSliceReady ? 'bg-emerald-500/10' : 'bg-transparent'} transition-colors duration-300 pointer-events-none"
+                            style="left: {trimStartPct * 100}%; right: {(1 - trimEndPct) * 100}%"
+                    >
+                        <div class="absolute -top-3 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity mt-6 z-30 pointer-events-none">
+                            <div class="bg-zinc-900 dark:bg-black text-white text-[10px] font-bold px-3 py-1.5 rounded-full shadow-xl flex items-center gap-1.5 border border-zinc-700/50">
+                                {#if isSlicing}
+                                    <RefreshCw size={12} class="animate-spin text-emerald-400" /> <span>Slicing...</span>
+                                {:else}
+                                    <Download size={12} class="text-emerald-400" /> <span>Drag to DAW</span>
+                                {/if}
+                            </div>
+                        </div>
+
+                        {#if appState.isPlaying && isSamplerOpen}
+                            <div class="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_10px_rgba(255,255,255,1)] z-50 pointer-events-none" style="left: {appState.playbackProgress * 100}%"></div>
+                        {/if}
+
+                        {#if isSliceReady}
+                            <div
+                                    use:nativeSliceDrag
+                                    class="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-emerald-900/40 cursor-grab active:cursor-grabbing backdrop-blur-sm z-30 pointer-events-auto"
+                            >
+                                <span class="text-white font-bold tracking-wider uppercase text-sm px-4 py-2 bg-black/80 shadow-xl rounded-md flex items-center gap-2"><Download size={16} /> Drag to DAW</span>
+                            </div>
+                        {:else}
+                            <div class="absolute -left-[11px] top-0 bottom-0 w-[22px] cursor-ew-resize flex flex-col items-center group/handle z-40 pointer-events-auto" onmousedown={(e) => { isDraggingHandle = 'start'; e.stopPropagation(); }}>
+                                <div class="w-0 h-0 border-l-[7px] border-r-[7px] border-t-[8px] border-l-transparent border-r-transparent border-t-emerald-600 group-hover/handle:border-t-emerald-400 group-active/handle:border-t-emerald-300 transition-colors drop-shadow-md"></div>
+                                <div class="w-px flex-1 bg-emerald-600/60 group-hover/handle:bg-emerald-400 transition-colors shadow-sm"></div>
+                            </div>
+
+                            <div class="absolute -right-[11px] top-0 bottom-0 w-[22px] cursor-ew-resize flex flex-col items-center group/handle z-40 pointer-events-auto" onmousedown={(e) => { isDraggingHandle = 'end'; e.stopPropagation(); }}>
+                                <div class="w-0 h-0 border-l-[7px] border-r-[7px] border-t-[8px] border-l-transparent border-r-transparent border-t-emerald-600 group-hover/handle:border-t-emerald-400 group-active/handle:border-t-emerald-300 transition-colors drop-shadow-md"></div>
+                                <div class="w-px flex-1 bg-emerald-600/60 group-hover/handle:bg-emerald-400 transition-colors shadow-sm"></div>
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+
+                <div class="mt-5 flex items-center justify-between">
+                    <button onclick={() => isLooping = !isLooping} class="flex items-center gap-2 px-3 py-2 rounded-md text-[11px] font-bold uppercase tracking-wider transition-colors {isLooping ? 'bg-emerald-500 text-white shadow-sm' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800/50 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-white'} cursor-pointer">
+                        <Repeat size={14} /> Loop
+                    </button>
+
+                    <div class="flex items-center gap-3">
+                        <button onclick={playSlicePreview} class="flex items-center gap-2 px-4 py-2 rounded-md text-xs font-bold uppercase tracking-wider transition-colors {appState.isPlaying ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-800 dark:text-white' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800/50 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-white'} cursor-pointer">
+                            {#if appState.isPlaying} <Pause size={14}/> Stop {:else} <Play size={14}/> Preview (Space) {/if}
+                        </button>
+
+                        {#if !isSliceReady}
+                            <button onclick={confirmSlice} disabled={isSlicing} class="flex items-center gap-2 px-5 py-2 rounded-md text-xs font-bold uppercase tracking-wider bg-emerald-500 text-white hover:bg-emerald-600 transition-colors shadow-sm disabled:opacity-50 cursor-pointer">
+                                {#if isSlicing} <RefreshCw size={14} class="animate-spin"/> Rendering... {:else} Confirm Selection {/if}
+                            </button>
+                        {:else}
+                            <button onclick={editSlice} class="flex items-center gap-2 px-5 py-2 rounded-md text-xs font-bold uppercase tracking-wider bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 transition-colors shadow-sm cursor-pointer">
+                                Edit Selection
+                            </button>
+                        {/if}
+                    </div>
+                </div>
             </div>
         </div>
     </div>
