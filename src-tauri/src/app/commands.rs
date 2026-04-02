@@ -28,6 +28,7 @@ pub struct SampleRecord {
     pub tags: String,
     pub waveform_data: Option<Vec<u8>>,
     pub is_liked: bool,
+    pub cover_path: Option<String>, // <--- ENTERPRISE FIX: Frontend benötigt dieses Feld!
 }
 
 // ==========================================
@@ -242,7 +243,7 @@ pub async fn get_samples(
     let total_count: i64 = count_query.build_query_scalar().fetch_one(pool).await.unwrap_or(0);
 
     // 2. DYNAMISCHE SAMPLES
-    let mut samples_query = QueryBuilder::new("SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.tags, s.waveform_data, s.is_liked FROM samples s ");
+    let mut samples_query = QueryBuilder::new("SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.tags, s.waveform_data, s.is_liked, s.cover_path FROM samples s ");
 
     if fts_match.is_some() { samples_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
 

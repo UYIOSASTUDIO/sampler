@@ -31,6 +31,7 @@ fn main() {
         .manage(audio_state)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_drag::init())
         .setup(|app_handle| {
             // --- NEU: Dynamische Berechnung der minimalen Fenstergröße ---
             if let Some(window) = app_handle.get_webview_window("main") {

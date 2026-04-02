@@ -3,9 +3,12 @@
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { convertFileSrc } from '@tauri-apps/api/core';
+    import { appDataDir } from '@tauri-apps/api/path';
     import { open } from '@tauri-apps/plugin-dialog';
+    import { writeFile, mkdir } from '@tauri-apps/plugin-fs';
     import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus, Music2 } from 'lucide-svelte';
     import { appState } from '$lib/store.svelte';
+    import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
     type SampleRecord = {
         id: string;
@@ -154,6 +157,12 @@
     onMount(async () => {
         // @ts-ignore
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+
+        // appDataDir einmalig auflösen und drag-icons Unterordner anlegen.
+        appDataDir().then(async dir => {
+            _appDataPath = dir.endsWith('/') || dir.endsWith('\\') ? dir : dir + '/';
+            try { await mkdir(_appDataPath + 'drag-icons', { recursive: true }); } catch { /* existiert bereits */ }
+        }).catch(e => console.warn('[SampleVault] appDataDir nicht aufgelöst:', e));
 
         window.addEventListener('keydown', handleKeydown);
         window.addEventListener('click', handleGlobalClick);
@@ -599,6 +608,10 @@
     // --- FILTER UI STATE ---
     // 'globalkey' ist das Piano-Dropdown für den globalen Pitch-Key im Player-Header
     let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | null = $state(null);
+
+    // Absoluter Pfad zum appDataDir — wird in onMount aufgelöst.
+    // Drag-Icons werden dort als 64×64 PNGs gecacht.
+    let _appDataPath = '';
     const whiteKeys = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
     const blackKeys = [
         { note: 'C#', left: '14.28%' }, { note: 'D#', left: '28.56%' }, { note: 'F#', left: '57.12%' }, { note: 'G#', left: '71.40%' }, { note: 'A#', left: '85.68%' }
@@ -823,6 +836,175 @@
         try {
             allAvailableTags = await invoke('get_all_available_tags');
         } catch (e) { console.error(e); }
+    }
+
+    // Cache: sample.id → absoluter Pfad zum 64×64 Drag-Icon PNG
+    const _dragIconCache = new Map<string, string>();
+
+    /**
+     * Erzeugt ein 64×64 PNG für den OS-Drag und cached es im appDataDir.
+     * - Cover vorhanden → Cover auf 64×64 verkleinert (kein riesiges Bild mehr am Cursor)
+     * - Kein Cover → generiertes Music-Note-Icon (dunkel + Emerald)
+     *
+     * Das Icon wird beim mousedown PARALLEL zur Drag-Geste erzeugt — by the time
+     * der User 5px bewegt hat, ist es fertig. Kein spürbarer Overhead.
+     */
+    async function prepareDragIcon(sample: SampleRecord): Promise<string> {
+        if (_dragIconCache.has(sample.id)) return _dragIconCache.get(sample.id)!;
+        if (!_appDataPath) return '';
+
+        const SIZE = 64;
+        const canvas = document.createElement('canvas');
+        canvas.width = SIZE; canvas.height = SIZE;
+        const ctx = canvas.getContext('2d')!;
+
+        let drewCover = false;
+        if (sample.cover_path) {
+            try {
+                // WICHTIG: img.src = convertFileSrc(...) → asset://localhost/ Origin →
+                // Canvas wird "tainted" → toBlob() wirft SecurityError.
+                // Fix: Bild per fetch() als Blob laden → createObjectURL() erzeugt eine
+                // blob:-URL (same-origin) → kein Taint → toBlob() funktioniert.
+                const response = await fetch(convertFileSrc(sample.cover_path!));
+                if (response.ok) {
+                    const imgBlob   = await response.blob();
+                    const objectUrl = URL.createObjectURL(imgBlob);
+                    const img       = new Image();
+                    await new Promise<void>((resolve) => {
+                        img.onload  = () => resolve();
+                        img.onerror = () => resolve();
+                        img.src     = objectUrl;
+                    });
+                    URL.revokeObjectURL(objectUrl); // Sofort freigeben
+                    if (img.naturalWidth > 0) {
+                        ctx.save();
+                        ctx.beginPath();
+                        if (ctx.roundRect) ctx.roundRect(0, 0, SIZE, SIZE, 10);
+                        else ctx.rect(0, 0, SIZE, SIZE); // Fallback für ältere WebViews
+                        ctx.clip();
+                        ctx.drawImage(img, 0, 0, SIZE, SIZE);
+                        ctx.restore();
+                        drewCover = true;
+                    }
+                }
+            } catch { /* Fehler → Fallback-Icon */ }
+        }
+
+        if (!drewCover) {
+            // Generiertes Icon: dunkler Hintergrund + Emerald Music-Note
+            ctx.fillStyle = '#27272a';
+            ctx.beginPath();
+            if (ctx.roundRect) ctx.roundRect(0, 0, SIZE, SIZE, 10);
+            else ctx.rect(0, 0, SIZE, SIZE);
+            ctx.fill();
+            ctx.fillStyle = '#22c55e';
+            ctx.font = 'bold 38px serif';
+            ctx.textAlign    = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('♪', SIZE / 2, SIZE / 2 + 2);
+        }
+
+        // Canvas → PNG-Bytes → Datei
+        const blob  = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const iconPath = _appDataPath + 'drag-icons/' + sample.id + '.png';
+
+        await writeFile(iconPath, bytes);
+        _dragIconCache.set(sample.id, iconPath);
+        return iconPath;
+    }
+
+    // --- ENTERPRISE OS-DRAG & DROP ---
+    // Kommuniziert direkt mit dem OS via @crabnebula/tauri-plugin-drag.
+    // Umgeht den Browser-Drag komplett — der User kann das Sample in seine DAW ziehen.
+    //
+    // Icon-Strategie:
+    //   prepareDragIcon() erzeugt beim mousedown PARALLEL ein 64×64 PNG (Cover oder
+    //   generiertes Music-Note-Icon). By the time der User 5px bewegt hat, ist das
+    //   Icon bereits fertig im Cache. Kein Overhead, kein riesiges Bild mehr am Cursor.
+    function nativeDrag(node: HTMLElement, sampleArg: SampleRecord) {
+        let sample     = sampleArg;
+        let startX     = 0;
+        let startY     = 0;
+        let isDragging = false;                      // Guard gegen parallele startDrag()-Aufrufe
+        let didDrag    = false;                      // Swallowed den nächsten click nach Drag
+        let iconPromise: Promise<string> | null = null; // Startet beim mousedown, await im move
+
+        const handleMouseMove = async (e: MouseEvent) => {
+            if (isDragging) return;
+
+            const dx = Math.abs(e.clientX - startX);
+            const dy = Math.abs(e.clientY - startY);
+
+            if (dx > 5 || dy > 5) {
+                isDragging = true;
+                cleanupWindowListeners();
+
+                try {
+                    // Icon wurde bereits beim mousedown vorbereitet — meistens schon fertig.
+                    const icon = await (iconPromise ?? prepareDragIcon(sample));
+                    await startDrag({ item: [sample.original_path], icon });
+                    didDrag = true;
+                } catch (err) {
+                    console.error('[SampleVault] OS-Drag fehlgeschlagen:', err);
+                } finally {
+                    isDragging = false;
+                }
+            }
+        };
+
+        const handleMouseUp = () => {
+            cleanupWindowListeners();
+        };
+
+        // Unterdrückt den click-Event der nach mousedown+mouseup noch gefeuert wird —
+        // verhindert versehentliche Sample-Wiedergabe oder Selektion nach einem Drag.
+        const handleClick = (e: MouseEvent) => {
+            if (didDrag) {
+                e.stopPropagation();
+                e.preventDefault();
+                didDrag = false;
+            }
+        };
+
+        const cleanupWindowListeners = () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+
+        const handleMouseDown = (e: MouseEvent) => {
+            if (e.button !== 0) return; // Nur Linksklick
+
+            // preventDefault verhindert Browser-Standard-Drag (Text-Selektion, Image-Ghost).
+            e.preventDefault();
+
+            startX      = e.clientX;
+            startY      = e.clientY;
+            isDragging  = false;
+            didDrag     = false;
+
+            // Icon parallel starten — während der User 5px bewegt, wird das PNG generiert.
+            // .catch(() => '') damit ein Fehler den Drag nicht blockiert.
+            iconPromise = prepareDragIcon(sample).catch(() => '');
+
+            window.addEventListener('mousemove', handleMouseMove);
+            window.addEventListener('mouseup',   handleMouseUp);
+        };
+
+        node.addEventListener('mousedown', handleMouseDown);
+        node.addEventListener('click',     handleClick);
+
+        return {
+            update(newSample: SampleRecord) {
+                sample      = newSample;
+                iconPromise = null; // Cache-Referenz zurücksetzen — neues Sample, neues Icon
+            },
+            destroy() {
+                node.removeEventListener('mousedown', handleMouseDown);
+                node.removeEventListener('click',     handleClick);
+                cleanupWindowListeners();
+            }
+        };
     }
 </script>
 
@@ -1130,22 +1312,31 @@
                                         {#each samples as sample}
                                             <div id="sample-{sample.id}" class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 rounded-md -mx-2 px-2 {selectedId === sample.id ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/20'}">
                                                 <div class="flex justify-center"><input type="checkbox" checked={appState.selectedSampleIds.includes(sample.id)} onchange={(e) => toggleSampleSelection(sample.id, e.currentTarget.checked)} class="h-4 w-4 rounded border-zinc-300 bg-zinc-100 cursor-pointer accent-zinc-900 dark:accent-zinc-100"></div>
-                                                <div class="h-10 w-10 flex items-center justify-center rounded-md bg-zinc-200/50 text-zinc-400 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 overflow-hidden shrink-0">
+                                                <div
+                                                        use:nativeDrag={sample}
+                                                        class="h-10 w-10 flex items-center justify-center rounded-md bg-zinc-200/50 text-zinc-400 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 overflow-hidden shrink-0 cursor-grab active:cursor-grabbing"
+                                                >
                                                     {#if sample.cover_path}
                                                         <img
                                                                 src={convertFileSrc(sample.cover_path)}
                                                                 alt="Cover"
-                                                                class="h-full w-full object-cover"
+                                                                class="h-full w-full object-cover pointer-events-none"
                                                                 loading="lazy"
                                                         />
                                                     {:else}
-                                                        <ImageIcon size={20} />
+                                                        <ImageIcon size={20} class="pointer-events-none" />
                                                     {/if}
                                                 </div>
                                                 <div class="flex justify-center"><button onclick={() => handlePlayRequest(sample)} class="flex h-8 w-8 items-center justify-center rounded-full bg-zinc-900 text-zinc-100 hover:scale-105 dark:bg-zinc-100 dark:text-zinc-900 transition-transform cursor-pointer shadow-sm">{#if playingId === sample.id} <Pause size={14} /> {:else} <Play size={14} class="ml-0.5" /> {/if}</button></div>
 
                                                 <div class="flex flex-col min-w-0 pr-4 cursor-pointer" role="button" tabindex="0" onclick={() => { selectedId = sample.id; }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') selectedId = sample.id; }}>
-                                                    <span class="truncate text-sm font-semibold cursor-pointer hover:underline" title={sample.original_path}>{sample.filename}</span>
+                                                    <span
+                                                            use:nativeDrag={sample}
+                                                            class="truncate text-sm font-semibold hover:underline cursor-grab active:cursor-grabbing select-none"
+                                                            title={sample.original_path}
+                                                    >
+                                                        {sample.filename}
+                                                    </span>
                                                     <div class="flex flex-wrap gap-1.5 mt-1 h-4 overflow-hidden">
                                                         {#each parseTags(sample.tags) as tag}
                                                             <span class="rounded px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider {tag.category === 'Format' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : tag.category === 'Drums' || tag.category === 'Percussion' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : tag.category === 'Genre' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-zinc-200/60 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400'}">{tag.value}</span>
@@ -1154,10 +1345,14 @@
                                                     </div>
                                                 </div>
 
-                                                <div class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity">
-                                                    {#each parseWaveform(sample.waveform_data) as barHeight, i} <div class="w-[3px] rounded-full {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div> {/each}
+                                                <div
+                                                        use:nativeDrag={sample}
+                                                        class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing"
+                                                >
+                                                    {#each parseWaveform(sample.waveform_data) as barHeight, i}
+                                                        <div class="w-[3px] rounded-full pointer-events-none {playingId === sample.id && (i / 40) <= playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div>
+                                                    {/each}
                                                 </div>
-
                                                 <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
                                                 <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.key_signature || "--"}</div>
                                                 <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.bpm ? Math.round(sample.bpm) : "--"}</div>

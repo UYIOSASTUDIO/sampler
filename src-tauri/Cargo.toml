@@ -47,6 +47,7 @@ sha2 = "0.10"   # Für die Deduplizierung
 # sha2 entfernt: Fast-Fingerprint (size+mtime) ersetzt vollständigen SHA256-Hash
 rubato = "0.15.0"
 ssstretch = "0.1.0"
+tauri-plugin-drag = "2.1.0"
 
 [profile.dev.package."*"]
 opt-level = 3

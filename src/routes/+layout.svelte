@@ -65,6 +65,17 @@
         if (savedTheme) {
             appState.themePreference = savedTheme;
         }
+
+        // ENTERPRISE FIX: Gespeichertes Volume synchron laden und validieren
+        const savedVolume = localStorage.getItem('samplevault-volume');
+        if (savedVolume !== null) {
+            const parsedVolume = parseFloat(savedVolume);
+            // Sicherheits-Check: Nur übernehmen, wenn es eine valide Zahl zwischen 0 und 1 ist
+            if (!isNaN(parsedVolume) && parsedVolume >= 0 && parsedVolume <= 1) {
+                appState.globalVolume = parsedVolume;
+            }
+        }
+
         systemMedia = window.matchMedia('(prefers-color-scheme: dark)');
         systemMedia.addEventListener('change', applyTheme);
 
@@ -107,6 +118,12 @@
     $effect(() => {
         if (appState.themePreference) {
             applyTheme();
+        }
+    });
+
+    $effect(() => {
+        if (typeof window !== 'undefined' && appState.globalVolume !== undefined) {
+            localStorage.setItem('samplevault-volume', appState.globalVolume.toString());
         }
     });
 
