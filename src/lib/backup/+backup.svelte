@@ -1,16 +1,4 @@
 <script lang="ts">
-    import type { SampleRecord, PaginatedResponse, ScanProgressPayload } from '$lib/types';
-    import { formatDuration } from '$lib/utils/format';
-    import { parseTags } from '$lib/utils/tags';
-    import { getSemitoneShift } from '$lib/utils/audio';
-    import SettingsView from '$lib/components/settings/SettingsView.svelte';
-    import MetadataEditor from '$lib/components/editor/MetadataEditor.svelte';
-    import Pagination from '$lib/components/browser/Pagination.svelte';
-    import BulkSidebar from '$lib/components/browser/BulkSidebar.svelte';
-    import FilterMenu from '$lib/components/browser/FilterMenu.svelte';
-    import { parseWaveform } from '$lib/utils/format';
-    import { getStretchRatio } from '$lib/utils/audio';
-
     import { onMount, onDestroy, tick } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
@@ -22,6 +10,34 @@
     import { FastForward, Rewind } from 'lucide-svelte';
     import { appState } from '$lib/store.svelte';
     import { startDrag } from '@crabnebula/tauri-plugin-drag';
+
+    type SampleRecord = {
+        id: string;
+        filename: string;
+        original_path: string;
+        duration_ms: number;
+        bpm: number | null;
+        key_signature: string | null;
+        instrument_type: string | null;
+        waveform_data: number[] | null;
+        tags: string;
+        is_liked: boolean;
+        cover_path: string | null; // <--- NEU: Der Pfad zum extrahierten Bild
+    };
+
+    function parseTags(tagsJson: string) {
+        try {
+            return JSON.parse(tagsJson);
+        } catch {
+            return [];
+        }
+    }
+
+    type PaginatedResponse = {
+        samples: SampleRecord[];
+        total_count: number;
+        available_tags: Array<{category: string, value: string}>;
+    };
 
     // --- SORT STATE ---
     let sortField: 'name' | 'type' | 'pack' | 'random' = $state('name');
@@ -56,6 +72,22 @@
     const pageSize: number = 50;
     let totalItems: number = $state(0);
     let totalPages: number = $derived(Math.ceil(totalItems / pageSize) || 1);
+
+    let visiblePages = $derived.by(() => {
+        let pages = [];
+        if (totalPages <= 5) {
+            for (let i = 1; i <= totalPages; i++) pages.push(i);
+        } else {
+            if (currentPage <= 3) {
+                pages = [1, 2, 3, 4, 5];
+            } else if (currentPage >= totalPages - 2) {
+                pages = [totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages];
+            } else {
+                pages = [currentPage - 2, currentPage - 1, currentPage, currentPage + 1, currentPage + 2];
+            }
+        }
+        return pages;
+    });
 
     // --- AUDIO STATE (Refactored to Rust Backend) ---
     let playingId: string | null = $state(null);
@@ -105,6 +137,7 @@
     let userTags: Array<{category: string, value: string}> = $state([]);
 
     // --- PROGRESS BAR STATE ---
+    type ScanProgressPayload = { total: number; current: number; current_file: string; };
     let scanTotal: number = $state(0);
     let scanCurrent: number = $state(0);
     let scanCurrentFile: string = $state('');
@@ -185,6 +218,13 @@
                 isTagDropdownOpen = false;
             }
         }
+        // In handleGlobalClick einfügen:
+        if (isBulkTagDropdownOpen) {
+            const target = e.target as HTMLElement;
+            if (!target.closest('.bulk-tag-dropdown-container')) {
+                isBulkTagDropdownOpen = false;
+            }
+        }
     };
 
     onMount(async () => {
@@ -231,6 +271,44 @@
     $effect(() => {
         invoke('set_audio_volume', { volume: appState.globalVolume });
     });
+
+    async function createNewTag() {
+        const trimmed = tagSearchQuery.trim();
+        if (trimmed === '') return;
+        try {
+            await invoke('create_user_tag', { category: 'User', value: trimmed });
+            await loadAllTags();
+            addTagToEditor('User', trimmed);
+        } catch (e) { console.error(e); }
+    }
+
+    async function handleDeleteUserTag(value: string, event: Event) {
+        event.stopPropagation();
+        try {
+            // 1. Backend: Tag komplett aus der DB und allen Samples löschen
+            await invoke('delete_user_tag', { value });
+
+            // 2. Frontend: Dropdown-Lexikon aktualisieren
+            await loadAllTags();
+
+            // 3. Frontend: Tag sofort aus dem aktuellen Editor-Fenster werfen
+            editForm.tags = editForm.tags.filter(t => t.value !== value);
+
+            // 4. Frontend: Tag live aus der Hauptliste im Hintergrund entfernen
+            samples = samples.map(sample => {
+                let parsed = parseTags(sample.tags);
+                let filtered = parsed.filter((t: {category: string, value: string}) => t.value !== value);
+
+                // Nur updaten, wenn der Tag in diesem Sample wirklich existierte
+                if (parsed.length !== filtered.length) {
+                    sample.tags = JSON.stringify(filtered);
+                }
+                return sample;
+            });
+        } catch (e) {
+            console.error(e);
+        }
+    }
 
     let lastToggle = $state(0); let lastNext = $state(0); let lastPrev = $state(0);
     $effect(() => {
@@ -473,6 +551,88 @@
         }
     }
 
+    // --- ENTERPRISE PITCH CALCULATION ---
+    const CHROMATIC_SCALE = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+    // Leitet den Mode ('min' | 'maj') aus einem key_signature String ab.
+    // Unterstützt: "C min", "D# minor", "F maj", "G major", Camelot "8A"(min)/"8B"(maj).
+    function parseKeyMode(keyStr: string): 'min' | 'maj' {
+        const lower = keyStr.toLowerCase().trim();
+        if (/\d+a$/.test(lower)) return 'min';    // Camelot: 8A → minor
+        if (/\d+b$/.test(lower)) return 'maj';    // Camelot: 8B → major
+        if (lower.includes('min')) return 'min';
+        return 'maj'; // Default: Major (auch für reine Noten wie "C" ohne Mode-Angabe)
+    }
+
+    // Extrahiert nur die Grund-Note aus einem key_signature String.
+    // "D# min" → "D#" | "Fmaj" → "F" | "8A" → chromatisch gelöst via Camelot-Map
+    function parseKeyNote(keyStr: string): string {
+        // Camelot-Format: Zahl + A/B → Note über Camelot-Wheel
+        const camelotMatch = keyStr.match(/^(1[0-2]|[1-9])([AB])$/i);
+        if (camelotMatch) {
+            const CAMELOT_TO_NOTE: Record<string, string> = {
+                '1A':'Ab','1B':'B','2A':'Eb','2B':'F#','3A':'Bb','3B':'Db',
+                '4A':'F','4B':'Ab','5A':'C','5B':'Eb','6A':'G','6B':'Bb',
+                '7A':'D','7B':'F','8A':'A','8B':'C','9A':'E','9B':'G',
+                '10A':'B','10B':'D','11A':'F#','11B':'A','12A':'Db','12B':'E'
+            };
+            const key = camelotMatch[1].toUpperCase() + camelotMatch[2].toUpperCase();
+            return CAMELOT_TO_NOTE[key] ?? '';
+        }
+        // Normales Format: erste Token ist die Note ("D#", "C", "F")
+        return keyStr.trim().split(/\s+/)[0].toUpperCase();
+    }
+
+    /**
+     * Berechnet den optimalen Pitch-Shift in Halbtönen zwischen einem Sample-Key
+     * und einem Ziel-Key unter Berücksichtigung der Relative-Key-Logik:
+     *
+     *   Ziel = D min, Sample = F maj  →  0 Halbtöne (selbe Skala, Parallele)
+     *   Ziel = D min, Sample = C maj  →  +5 Halbtöne (C→F, da Fmaj = Relativ-Major von Dmin)
+     *   Ziel = F maj, Sample = D min  →  0 Halbtöne (selbe Skala)
+     *
+     * Relative-Major ist immer 3 Halbtöne ÜBER dem Moll-Grundton.
+     * Relative-Minor ist immer 3 Halbtöne UNTER dem Dur-Grundton.
+     */
+    function getSemitoneShift(
+        sampleKey: string | null,
+        targetNote: string | null,
+        targetMode: 'min' | 'maj'
+    ): number {
+        if (!sampleKey || !targetNote) return 0;
+
+        const RELATIVE_SEMITONES = 3; // Durton liegt immer 3 HT über dem Mollton
+
+        const sNote = parseKeyNote(sampleKey);
+        const sMode = parseKeyMode(sampleKey);
+
+        const sIdx = CHROMATIC_SCALE.indexOf(sNote);
+        let tIdx  = CHROMATIC_SCALE.indexOf(targetNote.toUpperCase());
+
+        if (sIdx === -1 || tIdx === -1) return 0;
+
+        // Relative-Key-Anpassung: Wenn Sample und Ziel unterschiedliche Modi haben,
+        // pitchen wir das Sample auf den Relativ-Key des Ziels (gleiche Skala, anderer Startpunkt).
+        if (targetMode === 'min' && sMode === 'maj') {
+            // Ziel: Moll → Relativ-Dur des Ziels = tNote + 3 HT
+            // Beispiel: Ziel D min → Relativ-Dur = F maj → Major-Sample auf F pitchen
+            tIdx = (tIdx + RELATIVE_SEMITONES) % 12;
+        } else if (targetMode === 'maj' && sMode === 'min') {
+            // Ziel: Dur → Relativ-Moll des Ziels = tNote − 3 HT
+            // Beispiel: Ziel F maj → Relativ-Moll = D min → Minor-Sample auf D pitchen
+            tIdx = (tIdx - RELATIVE_SEMITONES + 12) % 12;
+        }
+        // Gleicher Modus: keine Anpassung nötig
+
+        let diff = tIdx - sIdx;
+
+        // Shortest Path: Niemals mehr als 6 Halbtöne pitchen (natürlichster Klang)
+        if (diff > 6)  diff -= 12;
+        if (diff < -6) diff += 12;
+
+        return diff;
+    }
+
     async function handlePlayRequest(sample: SampleRecord, forceRestart: boolean = false) {
         selectedId = sample.id;
 
@@ -522,7 +682,23 @@
         }
     }
 
+    function goToPage(p: number) { if (p !== currentPage) { currentPage = p; loadSamples(); } }
+    function nextPage() { if (currentPage < totalPages) { currentPage++; loadSamples(); } }
+    function prevPage() { if (currentPage > 1) { currentPage--; loadSamples(); } }
     function toggleFilter(type: string) { activeTypeFilter = activeTypeFilter === type ? null : type; currentPage = 1; loadSamples(); }
+    // ENTERPRISE FIX: Intelligentes Waveform-Downsampling
+    function parseWaveform(data: number[] | null, targetLength: number = 40): number[] {
+        if (!data || data.length === 0) return Array(targetLength).fill(10);
+        if (data.length === targetLength) return data;
+
+        const result = [];
+        const step = data.length / targetLength;
+        for (let i = 0; i < targetLength; i++) {
+            const idx = Math.floor(i * step);
+            result.push(data[Math.min(idx, data.length - 1)] || 10);
+        }
+        return result;
+    }
 
     // --- BATCH SCANNING QUEUE ---
     let scanQueue: string[] = $state([]);
@@ -600,9 +776,229 @@
         finally { isSyncing = false; }
     }
 
+    function formatDuration(ms: number): string {
+        if (ms === 0) return "--:--";
+        const totalSec = Math.floor(ms / 1000);
+        return `${Math.floor(totalSec / 60)}:${(totalSec % 60).toString().padStart(2, '0')}`;
+    }
+
+    // --- FILTER UI STATE ---
+    // 'globalkey' ist das Piano-Dropdown für den globalen Pitch-Key im Player-Header
+    let openDropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | 'globalbpm' | null = $state(null);
+
+    // Absoluter Pfad zum appDataDir — wird in onMount aufgelöst.
+    // Drag-Icons werden dort als 64×64 PNGs gecacht.
     let _appDataPath = '';
+    const whiteKeys = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
+    const blackKeys = [
+        { note: 'C#', left: '14.28%' }, { note: 'D#', left: '28.56%' }, { note: 'F#', left: '57.12%' }, { note: 'G#', left: '71.40%' }, { note: 'A#', left: '85.68%' }
+    ];
+
+    let activeKeyFilter = $derived(appState.filters.keys.length > 0 ? appState.filters.keys[0] : null);
+    let currentKeyMode = $derived.by(() => {
+        if (!activeKeyFilter) return null;
+        if (activeKeyFilter === 'min' || activeKeyFilter.endsWith(' min')) return 'min';
+        if (activeKeyFilter === 'maj' || activeKeyFilter.endsWith(' maj')) return 'maj';
+        return null;
+    });
+    let currentBaseNote = $derived.by(() => {
+        if (!activeKeyFilter) return null;
+        if (activeKeyFilter === 'min' || activeKeyFilter === 'maj') return null;
+        return activeKeyFilter.split(' ')[0];
+    });
+
+    function togglePianoKey(note: string) {
+        if (currentBaseNote === note) {
+            if (currentKeyMode) appState.filters.keys = [currentKeyMode];
+            else appState.filters.keys = [];
+        } else {
+            if (currentKeyMode) appState.filters.keys = [`${note} ${currentKeyMode}`];
+            else appState.filters.keys = [note];
+        }
+        currentPage = 1; loadSamples();
+    }
+
+    function switchKeyMode(mode: 'min' | 'maj') {
+        if (currentKeyMode === mode) {
+            if (currentBaseNote) appState.filters.keys = [currentBaseNote];
+            else appState.filters.keys = [];
+        } else {
+            if (currentBaseNote) appState.filters.keys = [`${currentBaseNote} ${mode}`];
+            else appState.filters.keys = [mode];
+        }
+        currentPage = 1; loadSamples();
+    }
+
+    function isPianoKeyActive(note: string) { return currentBaseNote === note; }
+
+    // --- GLOBAL KEY PIANO (Pitch-Shifter im Header) ---
+    // Setzt den globalen Pitch-Key. Schließt das Dropdown nicht automatisch —
+    // der User sieht sofort die Piano-Selektion und kann den Mode wechseln.
+    function setGlobalPianoKey(note: string) {
+        // Nochmals dieselbe Note → Toggle off
+        if (appState.globalKey === note) {
+            appState.globalKey = null;
+        } else {
+            appState.globalKey = note;
+        }
+    }
+
+    function isGlobalKeyActive(note: string) { return appState.globalKey === note; }
+
+    // Lesbarer Label für den Trigger-Button: "D min", "F# maj", "Off"
+    let globalKeyLabel = $derived(
+        appState.globalKey
+            ? `${appState.globalKey} ${appState.globalKeyMode}`
+            : 'Off'
+    );
+    // ─── BPM STRETCHER ───────────────────────────────────────────────────────────
+    // Returns the playback speed ratio needed to hit the global BPM target.
+    // Returns 1.0 when the sample has no BPM data or globalBpm is off.
+    function getStretchRatio(sample: SampleRecord): number {
+        if (!appState.globalBpm || !sample.bpm || sample.bpm <= 0) return 1.0;
+        return appState.globalBpm / sample.bpm;
+    }
+
+    // Lesbarer Label für den BPM Trigger-Button: "120 BPM" oder "BPM"
+    let globalBpmLabel = $derived(
+        appState.globalBpm ? `${appState.globalBpm} BPM` : 'BPM'
+    );
+
+    function toggleTagMatchMode() { appState.filters.tagMatchMode = appState.filters.tagMatchMode === 'AND' ? 'OR' : 'AND'; currentPage = 1; loadSamples(); }
+
+    let isTagsExpanded: boolean = $state(false);
+    let sortedAvailableTags = $derived.by(() => {
+        // HIER ÄNDERN:
+        return [...activeDropdownTags].sort((a, b) => {
+            const aActive = isTagActive(a.category, a.value) ? 1 : 0;
+            const bActive = isTagActive(b.category, b.value) ? 1 : 0;
+            if (aActive !== bActive) return bActive - aActive;
+            return 0;
+        });
+    });
+
+    function toggleDropdown(dropdown: 'instrument' | 'genre' | 'key' | 'bpm' | 'format' | 'globalkey' | 'globalbpm', event: Event) {
+        event.stopPropagation();
+        openDropdown = openDropdown === dropdown ? null : dropdown;
+    }
+
+    function toggleFilterTag(category: string, value: string) {
+        if (category === 'Format') {
+            // ENTERPRISE FIX: Radio-Button Logik für Formate (Exklusive Auswahl)
+            // Wenn der Tag bereits aktiv ist, wird er deaktiviert.
+            // Ansonsten wird er als einziger Tag in das Array gelegt (überschreibt vorherige).
+            if (appState.filters.formats.includes(value)) {
+                appState.filters.formats = [];
+            } else {
+                appState.filters.formats = [value];
+            }
+        } else {
+            // Standard Checkbox-Logik für alle anderen Kategorien (Mehrfachauswahl)
+            let targetArray: string[];
+            if (category === 'Genre') targetArray = appState.filters.genres;
+            else if (category === 'Key') targetArray = appState.filters.keys;
+            else targetArray = appState.filters.instruments;
+
+            const idx = targetArray.indexOf(value);
+            if (idx > -1) targetArray.splice(idx, 1);
+            else targetArray.push(value);
+
+            if (category === 'Genre') appState.filters.genres = [...targetArray];
+            else if (category === 'Key') appState.filters.keys = [...targetArray];
+            else appState.filters.instruments = [...targetArray];
+        }
+
+        currentPage = 1;
+        loadSamples();
+    }
+
+    function isTagActive(category: string, value: string): boolean {
+        if (category === 'Genre') return appState.filters.genres.includes(value);
+        if (category === 'Format') return appState.filters.formats.includes(value);
+        if (category === 'Key') return appState.filters.keys.includes(value);
+        return appState.filters.instruments.includes(value);
+    }
+
+    function clearAllFilters() {
+        appState.filters.instruments = []; appState.filters.genres = []; appState.filters.formats = []; appState.filters.keys = [];
+        appState.filters.bpm.exact = null; appState.filters.bpm.min = null; appState.filters.bpm.max = null;
+        appState.filters.tagMatchMode = 'AND';
+        currentPage = 1; loadSamples();
+    }
+
+    // --- SETTINGS MODAL LOGIC ---
+    let connectedFolders: string[] = $state([]);
+    let isSettingsLoading: boolean = $state(false);
+
+    function setThemePref(pref: 'light' | 'dark' | 'system') {
+        appState.themePreference = pref;
+        localStorage.setItem('samplevault-theme', pref);
+    }
 
     $effect(() => { if (appState.currentView === 'settings') loadConnectedFolders(); });
+
+    async function loadConnectedFolders() {
+        isSettingsLoading = true;
+        try { connectedFolders = await invoke<string[]>('get_connected_folders'); }
+        catch (error) { console.error(error); }
+        finally { isSettingsLoading = false; }
+    }
+
+    async function handleRemoveFolder(folderPath: string) {
+        // ENTERPRISE FIX: Nativer, asynchroner OS-Dialog blockiert die UI nicht fehlerhaft!
+        const confirmed = await ask(`Un-link this folder?\n\n${folderPath}\n\nThis will remove all its samples from your library.`, {
+            title: 'SampleVault',
+            kind: 'warning'
+        });
+        if (!confirmed) return;
+
+        isSettingsLoading = true;
+        try {
+            await invoke('remove_folder', { path: folderPath });
+            await loadConnectedFolders();
+            currentPage = 1; await loadSamples();
+        } catch (error) { console.error(error); }
+        finally { isSettingsLoading = false; }
+    }
+
+    async function handleClearDatabase() {
+        const confirmed = await ask("Clear the entire library? This action cannot be undone.", {
+            title: 'SampleVault',
+            kind: 'warning'
+        });
+
+        if (confirmed) {
+            isClearing = true;
+            try {
+                // 1. Audio strikt stoppen
+                if (appState.isPlaying) {
+                    invoke('stop_audio').catch(console.error);
+                    appState.isPlaying = false;
+                    cancelAnimationFrame(animationFrameId);
+                }
+
+                // 2. Globalen Player-State restlos nullen (behebt den Ghost-Sound im Footer)
+                appState.currentSample = null;
+                selectedId = null;
+                playingId = null;
+
+                // 3. Datenbank leeren
+                await invoke('clear_database');
+
+                // 4. UI-Listen nullen (behebt das Stale-UI im Settings-Menü)
+                activeTypeFilter = null;
+                currentPage = 1;
+                samples = [];
+                totalItems = 0;
+                appState.collections = [];
+                appState.filters.collectionId = null;
+                connectedFolders = []; // <--- WICHTIG FÜR SETTINGS TAB!
+
+                scanMessage = 'Library cleared.';
+            } catch (error) { scanMessage = `Error: ${error}`; }
+            finally { isClearing = false; }
+        }
+    }
 
     function toggleSampleSelection(id: string, checked: boolean) {
         if (checked) {
@@ -612,14 +1008,66 @@
         }
     }
 
+    async function handleBulkAddToCollection(collectionId: number) {
+        const ids = [...appState.selectedSampleIds];
+        appState.selectedSampleIds = [];
+        try { await invoke('add_to_collection', { collectionId, sampleIds: ids }); }
+        catch (e) { console.error(e); }
+    }
+
+    async function handleBulkLike() {
+        const ids = [...appState.selectedSampleIds];
+        samples.forEach(s => { if (ids.includes(s.id)) s.is_liked = true; });
+        samples = [...samples];
+        appState.selectedSampleIds = [];
+        try { await invoke('bulk_toggle_like', { sampleIds: ids, isLiked: true }); }
+        catch (e) { console.error(e); }
+    }
+
     // --- CONTEXT MENU & EDITOR STATE ---
     let openContextMenuId: string | null = $state(null);
     let editingSample: SampleRecord | null = $state(null);
+    let editForm = $state({ filename: '', bpm: null as number | null, key_signature: '', tags: [] as Array<{category: string, value: string}> });
+    let isTagDropdownOpen: boolean = $state(false);
 
     function openEditModal(sample: SampleRecord) {
         editingSample = sample;
         editForm = { filename: sample.filename, bpm: sample.bpm, key_signature: sample.key_signature || '', tags: parseTags(sample.tags) };
         openContextMenuId = null; isTagDropdownOpen = false; tagSearchQuery = '';
+    }
+
+    function removeTagFromEditor(index: number) {
+        editForm.tags.splice(index, 1);
+        editForm.tags = [...editForm.tags];
+    }
+
+    function addTagToEditor(category: string, value: string) {
+        if (!editForm.tags.some(t => t.value === value && t.category === category)) {
+            editForm.tags.push({ category, value });
+            editForm.tags = [...editForm.tags];
+        }
+        isTagDropdownOpen = false; tagSearchQuery = '';
+    }
+
+    async function saveMetadata() {
+        if (!editingSample) return;
+        try {
+            const tagsJson = JSON.stringify(editForm.tags);
+            await invoke('update_sample_metadata', {
+                payload: {
+                    id: editingSample.id, filename: editForm.filename.trim(), bpm: editForm.bpm,
+                    keySignature: editForm.key_signature.trim() !== '' ? editForm.key_signature.trim() : null, tags: tagsJson
+                }
+            });
+
+            const index = samples.findIndex(s => s.id === editingSample!.id);
+            if (index !== -1) {
+                samples[index].filename = editForm.filename.trim(); samples[index].bpm = editForm.bpm;
+                samples[index].key_signature = editForm.key_signature.trim() !== '' ? editForm.key_signature.trim() : null;
+                samples[index].tags = tagsJson;
+            }
+            samples = [...samples]; editingSample = null;
+        } catch(e) { console.error("Failed to save metadata:", e); }
     }
 
     // --- TAGS LOGIC ---
@@ -1101,6 +1549,118 @@
             else handlePlayRequest(appState.currentSample, true); // Neustart in Liste
         }
     }
+
+    // --- ENTERPRISE BULK TAGGING STATE ---
+    let isBulkTagDropdownOpen = $state(false);
+    let bulkTagSearchQuery = $state('');
+    let isBulkTagging = $state(false);
+
+    // 1. Mappt die ausgewählten IDs zu echten SampleRecords
+    let selectedSampleRecords = $derived(samples.filter(s => appState.selectedSampleIds.includes(s.id)));
+
+    // 2. Errechnet blitzschnell die Schnittmenge (Tags, die ALLE ausgewählten Samples gemeinsam haben)
+    let commonTags = $derived.by(() => {
+        if (selectedSampleRecords.length === 0) return [];
+
+        let shared = parseTags(selectedSampleRecords[0].tags);
+        for (let i = 1; i < selectedSampleRecords.length; i++) {
+            const currentTags = parseTags(selectedSampleRecords[i].tags);
+            shared = shared.filter(st => currentTags.some(ct => ct.category === st.category && ct.value === st.value));
+        }
+        return shared;
+    });
+
+    let filteredBulkTags = $derived(
+        allAvailableTags.filter(t => t.value.toLowerCase().includes(bulkTagSearchQuery.toLowerCase()))
+    );
+
+    // --- ENTERPRISE BULK TAG PROCESSING ---
+    async function handleBulkAddTag(category: string, value: string) {
+        isBulkTagDropdownOpen = false;
+        bulkTagSearchQuery = '';
+        isBulkTagging = true;
+
+        const tagToAdd = { category, value };
+        const updates = [];
+
+        // Optimistic UI Update: Wir updaten den lokalen State sofort
+        for (let sample of selectedSampleRecords) {
+            let currentTags = parseTags(sample.tags);
+
+            if (!currentTags.some(t => t.category === category && t.value === value)) {
+                currentTags.push(tagToAdd);
+                sample.tags = JSON.stringify(currentTags);
+
+                updates.push(invoke('update_sample_metadata', {
+                    payload: {
+                        id: sample.id,
+                        filename: sample.filename,
+                        bpm: sample.bpm,
+                        keySignature: sample.key_signature,
+                        tags: sample.tags
+                    }
+                }));
+            }
+        }
+
+        samples = [...samples]; // Triggert das UI Rerendering sofort
+
+        try {
+            await Promise.all(updates); // Feuert alle Rust-Updates asynchron im Hintergrund ab
+        } catch(e) { console.error("Bulk tag add failed:", e); }
+        finally { isBulkTagging = false; }
+    }
+
+    async function handleBulkRemoveTag(category: string, value: string) {
+        isBulkTagging = true;
+        const updates = [];
+
+        for (let sample of selectedSampleRecords) {
+            let currentTags = parseTags(sample.tags);
+            const originalLength = currentTags.length;
+
+            currentTags = currentTags.filter(t => !(t.category === category && t.value === value));
+
+            if (currentTags.length < originalLength) {
+                sample.tags = JSON.stringify(currentTags);
+                updates.push(invoke('update_sample_metadata', {
+                    payload: {
+                        id: sample.id,
+                        filename: sample.filename,
+                        bpm: sample.bpm,
+                        keySignature: sample.key_signature,
+                        tags: sample.tags
+                    }
+                }));
+            }
+        }
+
+        samples = [...samples];
+
+        try {
+            await Promise.all(updates);
+        } catch(e) { console.error("Bulk tag remove failed:", e); }
+        finally { isBulkTagging = false; }
+    }
+
+    // --- ENTERPRISE BULK TAG CREATION ---
+    async function createNewBulkTag() {
+        const trimmed = bulkTagSearchQuery.trim();
+        if (trimmed === '') return;
+
+        try {
+            // 1. Rust anweisen, den Tag global in der DB zu registrieren
+            await invoke('create_user_tag', { category: 'User', value: trimmed });
+
+            // 2. Das globale Frontend-Lexikon aktualisieren
+            await loadAllTags();
+
+            // 3. Den neuen Tag direkt auf alle ausgewählten Samples anwenden
+            await handleBulkAddTag('User', trimmed);
+        } catch (e) {
+            console.error("Failed to create bulk tag:", e);
+        }
+    }
 </script>
 
 {#if appState.currentView === 'sounds'}
@@ -1213,12 +1773,286 @@
             {:else}
                 <div class="pb-8">
                     <div class="pl-8 pr-8 w-full">
-                        <FilterMenu
-                                {activeDropdownTags}
-                                {sortedAvailableTags}
-                                {availableTags}
-                                loadSamples={() => { currentPage = 1; loadSamples(); }}
-                        />
+                        <div class="mb-6 space-y-3">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('instrument', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.instruments.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Instrument {#if appState.filters.instruments.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.instruments.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'instrument' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each activeDropdownTags.filter(t => !['Genre', 'Format', 'Key', 'Character'].includes(t.category)) as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive(tag.category, tag.value)} onchange={() => toggleFilterTag(tag.category, tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('genre', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.genres.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Genre {#if appState.filters.genres.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.genres.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'genre' ? 'flex' : 'hidden'} w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each activeDropdownTags.filter(t => t.category === 'Genre') as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Genre', tag.value)} onchange={() => toggleFilterTag('Genre', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('key', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.keys.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Key {#if appState.filters.keys.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.keys.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'key' ? 'flex' : 'hidden'} w-64 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50 w-full">
+                                            <button onclick={() => switchKeyMode('min')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'min' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Minor</button>
+                                            <button onclick={() => switchKeyMode('maj')} class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer {currentKeyMode === 'maj' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Major</button>
+                                        </div>
+                                        <div class="relative flex w-full h-24 rounded border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
+                                            {#each whiteKeys as note} <button onclick={() => togglePianoKey(note)} class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer {isPianoKeyActive(note) ? 'bg-zinc-200 dark:bg-zinc-600 text-zinc-900 dark:text-white shadow-inner' : 'bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700'}">{note}</button> {/each}
+                                            {#each blackKeys as bk} <button onclick={() => togglePianoKey(bk.note)} style="left: {bk.left}; transform: translateX(-50%);" class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10 {isPianoKeyActive(bk.note) ? 'bg-zinc-500 text-white shadow-inner' : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800 dark:bg-black dark:hover:bg-zinc-900'}">{bk.note}</button> {/each}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('bpm', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {(appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max) ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        BPM {#if appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">!</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'bpm' ? 'flex' : 'hidden'} w-56 flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="flex items-center justify-between border-b border-zinc-100 pb-2 dark:border-zinc-800">
+                                            <span class="text-xs font-semibold">Mode</span><label class="flex items-center gap-2 text-[10px] uppercase font-bold tracking-wider cursor-pointer"><input type="checkbox" bind:checked={appState.filters.bpm.isRange} class="rounded border-zinc-300 accent-zinc-900"> Range</label>
+                                        </div>
+                                        {#if appState.filters.bpm.isRange}
+                                            <div class="flex items-center gap-2"><input type="number" bind:value={appState.filters.bpm.min} placeholder="Min" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"><span class="text-xs text-zinc-500">-</span><input type="number" bind:value={appState.filters.bpm.max} placeholder="Max" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100"></div>
+                                        {:else}
+                                            <input type="number" bind:value={appState.filters.bpm.exact} placeholder="Exact BPM (e.g. 120)" class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-100">
+                                        {/if}
+                                        <div class="flex gap-2 mt-1">
+                                            <button onclick={() => { appState.filters.bpm.exact = null; appState.filters.bpm.min = null; appState.filters.bpm.max = null; currentPage = 1; loadSamples(); openDropdown = null; }} class="w-1/3 rounded border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer">Clear</button>
+                                            <button onclick={() => { openDropdown = null; currentPage = 1; loadSamples(); }} class="w-2/3 rounded bg-zinc-900 px-2 py-1.5 text-xs text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white cursor-pointer">Apply</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="relative">
+                                    <button onclick={(e) => toggleDropdown('format', e)} class="flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-semibold transition-colors cursor-pointer {appState.filters.formats.length > 0 ? 'border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800'}">
+                                        Format {#if appState.filters.formats.length > 0}<span class="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-900 text-[9px] text-white dark:bg-zinc-100 dark:text-zinc-900">{appState.filters.formats.length}</span>{/if}<ChevronDown size={14} class="opacity-50" />
+                                    </button>
+                                    <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-1 {openDropdown === 'format' ? 'flex' : 'hidden'} w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                        <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5">
+                                            {#each activeDropdownTags.filter(t => t.category === 'Format') as tag}
+                                                <label class="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"><input type="checkbox" checked={isTagActive('Format', tag.value)} onchange={() => toggleFilterTag('Format', tag.value)} class="rounded border-zinc-300 dark:border-zinc-700 accent-zinc-900 dark:accent-zinc-100 cursor-pointer"> {tag.value}</label>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {#if appState.filters.instruments.length > 0 || appState.filters.genres.length > 0 || appState.filters.formats.length > 0 || appState.filters.keys.length > 0 || appState.filters.bpm.exact || appState.filters.bpm.min || appState.filters.bpm.max}
+                                    <button onclick={clearAllFilters} class="ml-2 flex h-8 items-center text-xs font-semibold text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 transition-colors cursor-pointer">Clear all</button>
+                                {/if}
+
+                                <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
+
+                                <div class="relative shrink-0">
+                                    <button
+                                            onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalkey' ? null : 'globalkey'; }}
+                                            class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
+                                               {appState.globalKey
+                                                   ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm shadow-emerald-500/30 dark:shadow-emerald-500/20'
+                                                   : 'border-emerald-500/40 bg-emerald-50 text-emerald-700 hover:border-emerald-500 hover:bg-emerald-100 dark:border-emerald-500/20 dark:bg-emerald-500/5 dark:text-emerald-400 dark:hover:border-emerald-500/50 dark:hover:bg-emerald-500/10'}"
+                                    >
+                                        <Music2 size={13} class="shrink-0 {appState.globalKey ? 'opacity-100' : 'opacity-70'}" />
+                                        <span>{globalKeyLabel}</span>
+                                        {#if !appState.globalKey}
+                                            <ChevronDown size={12} class="opacity-50" />
+                                        {:else}
+                                            <span class="relative flex h-1.5 w-1.5 shrink-0">
+                                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
+                                            </span>
+                                        {/if}
+                                    </button>
+
+                                    {#if openDropdown === 'globalkey'}
+                                        <div
+                                                onclick={(e) => e.stopPropagation()}
+                                                class="absolute right-0 top-full mt-2 flex w-72 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50"
+                                        >
+                                            <div class="flex items-center gap-2 pb-1 border-b border-zinc-100 dark:border-zinc-800">
+                                                <Music2 size={13} class="text-emerald-500 shrink-0" />
+                                                <span class="text-[11px] font-bold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Auto-Pitch Key</span>
+                                            </div>
+
+                                            <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50">
+                                                <button
+                                                        onclick={() => { appState.globalKeyMode = 'min'; }}
+                                                        class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                           {appState.globalKeyMode === 'min'
+                                                               ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                               : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                                >Minor</button>
+                                                <button
+                                                        onclick={() => { appState.globalKeyMode = 'maj'; }}
+                                                        class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer
+                                                           {appState.globalKeyMode === 'maj'
+                                                               ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white'
+                                                               : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+                                                >Major</button>
+                                            </div>
+
+                                            <div class="relative flex w-full h-24 rounded-lg border border-zinc-300 dark:border-zinc-700 overflow-hidden select-none">
+                                                {#each whiteKeys as note}
+                                                    <button
+                                                            onclick={() => setGlobalPianoKey(note)}
+                                                            class="flex-1 flex items-end justify-center pb-2 text-[10px] font-bold border-r border-zinc-200 dark:border-zinc-700 last:border-0 transition-colors cursor-pointer
+                                                               {isGlobalKeyActive(note)
+                                                                   ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                                                                   : 'bg-white dark:bg-zinc-800 text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700'}"
+                                                    >{note}</button>
+                                                {/each}
+                                                {#each blackKeys as bk}
+                                                    <button
+                                                            onclick={() => setGlobalPianoKey(bk.note)}
+                                                            style="left: {bk.left}; transform: translateX(-50%);"
+                                                            class="absolute top-0 w-[9%] h-14 rounded-b flex items-end justify-center pb-1.5 text-[8px] font-bold transition-colors cursor-pointer z-10
+                                                               {isGlobalKeyActive(bk.note)
+                                                                   ? 'bg-emerald-600 text-white shadow-inner'
+                                                                   : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-700 dark:bg-black dark:hover:bg-zinc-900'}"
+                                                    >{bk.note}</button>
+                                                {/each}
+                                            </div>
+
+                                            {#if appState.globalKey}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Samples in <span class="font-semibold text-emerald-600 dark:text-emerald-400">{globalKeyLabel}</span> werden automatisch gepitched. {appState.globalKeyMode === 'min' ? 'Major-Samples' : 'Minor-Samples'} landen auf dem Relativ-{appState.globalKeyMode === 'min' ? 'Dur' : 'Moll'}.
+                                                </p>
+                                            {/if}
+
+                                            <button
+                                                    onclick={() => { appState.globalKey = null; openDropdown = null; }}
+                                                    class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
+                                            >Turn Off</button>
+                                        </div>
+                                    {/if}
+                                </div>
+
+                                <!-- BPM Pill Divider -->
+                                <div class="mx-1 h-5 w-px bg-zinc-300 dark:bg-zinc-700 shrink-0"></div>
+
+                                <!-- ── BPM Stretcher Pill ── -->
+                                <div class="relative shrink-0">
+                                    <button
+                                            onclick={(e) => { e.stopPropagation(); openDropdown = openDropdown === 'globalbpm' ? null : 'globalbpm'; }}
+                                            class="flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-bold transition-all cursor-pointer
+                                               {appState.globalBpm
+                                                   ? 'border-violet-500 bg-violet-500 text-white shadow-sm shadow-violet-500/30 dark:shadow-violet-500/20'
+                                                   : 'border-violet-500/40 bg-violet-50 text-violet-700 hover:border-violet-500 hover:bg-violet-100 dark:border-violet-500/20 dark:bg-violet-500/5 dark:text-violet-400 dark:hover:border-violet-500/50 dark:hover:bg-violet-500/10'}"
+                                    >
+                                        <Gauge size={13} class="shrink-0 {appState.globalBpm ? 'opacity-100' : 'opacity-70'}" />
+                                        <span>{globalBpmLabel}</span>
+                                        {#if !appState.globalBpm}
+                                            <ChevronDown size={12} class="opacity-50" />
+                                        {:else}
+                                            <span class="relative flex h-1.5 w-1.5 shrink-0">
+                                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+                                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
+                                            </span>
+                                        {/if}
+                                    </button>
+
+                                    {#if openDropdown === 'globalbpm'}
+                                        <div
+                                                onclick={(e) => e.stopPropagation()}
+                                                class="absolute left-0 top-full mt-2 w-64 flex-col gap-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-700/60 dark:bg-[#18181b] z-50 flex"
+                                        >
+                                            <!-- Header -->
+                                            <div class="flex items-center gap-2 border-b border-zinc-100 pb-2.5 dark:border-zinc-800">
+                                                <Gauge size={13} class="text-violet-500 shrink-0" />
+                                                <span class="text-xs font-bold text-zinc-700 dark:text-zinc-200">BPM Stretcher</span>
+                                            </div>
+
+                                            <!-- BPM Input with +/- controls -->
+                                            <div class="flex items-center gap-2">
+                                                <button
+                                                        onclick={() => { if (appState.globalBpm && appState.globalBpm > 1) appState.globalBpm = Math.max(1, appState.globalBpm - 1); }}
+                                                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-sm font-bold text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors cursor-pointer select-none"
+                                                >−</button>
+                                                <input
+                                                        type="number"
+                                                        min="1"
+                                                        max="300"
+                                                        placeholder="e.g. 120"
+                                                        value={appState.globalBpm ?? ''}
+                                                        oninput={(e) => {
+                                                            const v = parseInt((e.target as HTMLInputElement).value);
+                                                            appState.globalBpm = (!isNaN(v) && v > 0) ? v : null;
+                                                        }}
+                                                        class="h-8 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-center text-sm font-bold text-zinc-900 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500/30 dark:border-zinc-700 dark:bg-zinc-800 dark:text-white dark:focus:border-violet-500 transition-colors"
+                                                />
+                                                <button
+                                                        onclick={() => { appState.globalBpm = (appState.globalBpm ?? 119) + 1; }}
+                                                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 text-sm font-bold text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors cursor-pointer select-none"
+                                                >+</button>
+                                            </div>
+
+                                            <!-- Common BPM presets -->
+                                            <div>
+                                                <p class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Presets</p>
+                                                <div class="grid grid-cols-5 gap-1">
+                                                    {#each [80, 90, 100, 110, 120, 128, 140, 150, 160, 174] as preset}
+                                                        <button
+                                                                onclick={() => { appState.globalBpm = preset; }}
+                                                                class="rounded-md py-1.5 text-xs font-semibold transition-colors cursor-pointer
+                                                                   {appState.globalBpm === preset
+                                                                       ? 'bg-violet-500 text-white shadow-sm'
+                                                                       : 'bg-zinc-100 text-zinc-600 hover:bg-violet-50 hover:text-violet-700 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-violet-500/10 dark:hover:text-violet-300'}"
+                                                        >{preset}</button>
+                                                    {/each}
+                                                </div>
+                                            </div>
+
+                                            <!-- Hint -->
+                                            {#if appState.globalBpm}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Samples mit bekanntem BPM werden auf <span class="font-semibold text-violet-600 dark:text-violet-400">{appState.globalBpm} BPM</span> gestreckt — ohne Pitch-Änderung.
+                                                </p>
+                                            {:else}
+                                                <p class="text-[10px] text-zinc-400 dark:text-zinc-500 leading-relaxed">
+                                                    Wähle ein Ziel-BPM. Nur Samples mit bekanntem BPM werden beeinflusst.
+                                                </p>
+                                            {/if}
+
+                                            <!-- Turn Off -->
+                                            <button
+                                                    onclick={() => { appState.globalBpm = null; openDropdown = null; }}
+                                                    class="w-full rounded-lg py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 transition-colors cursor-pointer border border-transparent hover:border-zinc-200 dark:hover:border-zinc-700"
+                                            >Turn Off</button>
+                                        </div>
+                                    {/if}
+                                </div>
+
+                                <div class="ml-auto flex items-center gap-2">
+                                    <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Match:</span>
+                                    <div class="flex h-8 rounded-full border border-zinc-200 bg-zinc-50 p-[3px] dark:border-zinc-700/50 dark:bg-zinc-900">
+                                        <button onclick={() => { appState.filters.tagMatchMode = 'OR'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'OR' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Either</button>
+                                        <button onclick={() => { appState.filters.tagMatchMode = 'AND'; currentPage = 1; loadSamples(); }} class="px-3 text-[10px] font-bold uppercase tracking-wider rounded-full transition-colors cursor-pointer {appState.filters.tagMatchMode === 'AND' ? 'bg-emerald-500 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Both</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="relative w-full">
+                                <div class="flex w-full flex-wrap content-start items-start gap-2 pr-10 transition-all {isTagsExpanded ? 'h-auto pb-1' : 'h-6 overflow-hidden'}">
+                                    {#each sortedAvailableTags as tag (tag.category + tag.value)}
+                                        <button onclick={() => toggleFilterTag(tag.category, tag.value)} class="shrink-0 flex items-center h-6 rounded-full border px-3 text-[11px] font-semibold cursor-pointer transition-colors {isTagActive(tag.category, tag.value) ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900' : 'border-zinc-200 bg-zinc-50 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-400 dark:hover:bg-zinc-800'}">{tag.value} {#if isTagActive(tag.category, tag.value)}<span class="ml-1.5 opacity-50 font-normal hover:opacity-100">✕</span>{/if}</button>
+                                    {/each}
+                                </div>
+                                {#if sortedAvailableTags.length > 0}
+                                    <div class="absolute right-0 top-0 h-6 bg-gradient-to-l from-white via-white to-transparent pl-8 pr-1 dark:from-[#18181b] dark:via-[#18181b]">
+                                        <button onclick={() => isTagsExpanded = !isTagsExpanded} class="flex h-full items-center justify-center rounded px-1.5 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer">{#if isTagsExpanded}<span class="text-sm font-bold leading-none mt-[1px]">✕</span>{:else}<span class="text-sm font-bold leading-none tracking-widest -mt-2">...</span>{/if}</button>
+                                    </div>
+                                {/if}
+                            </div>
+                        </div>
 
                         <div class="mb-4 flex items-center justify-between text-sm text-zinc-500 relative">
                             <span>{#if isLoading}Loading...{:else}{totalItems} results{/if}</span>
@@ -1389,13 +2223,99 @@
                         </div>
                     </div>
 
-                    <Pagination bind:currentPage {totalPages} {loadSamples} />
+                    {#if totalPages > 1}
+                        <div class="w-full">
+                            <div class="flex items-center justify-center pb-8 pt-4">
+                                <div class="flex items-center gap-1">
+                                    <button onclick={prevPage} disabled={currentPage === 1} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer mr-2"><ChevronLeft size={18} /></button>
+                                    {#each visiblePages as pageNum} <button onclick={() => goToPage(pageNum)} class="flex items-center justify-center h-8 w-8 rounded text-sm font-medium transition-colors cursor-pointer {pageNum === currentPage ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}">{pageNum}</button> {/each}
+                                    <button onclick={nextPage} disabled={currentPage === totalPages} class="flex items-center justify-center h-8 w-8 rounded text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-zinc-800 transition-colors cursor-pointer ml-2"><ChevronRight size={18} /></button>
+                                </div>
+                            </div>
+                        </div>
+                    {/if}
 
                 </div>
             {/if}
         </div>
 
-        <BulkSidebar bind:samples {allAvailableTags} {loadAllTags} />
+        <div class="absolute right-0 top-0 bottom-0 w-72 bg-white/95 backdrop-blur-xl border-l border-zinc-200 dark:border-zinc-800/60 dark:bg-[#18181b]/95 shadow-2xl transition-transform duration-300 flex flex-col z-50 {appState.selectedSampleIds.length > 0 ? 'translate-x-0' : 'translate-x-full'}">
+            <div class="flex items-center justify-between px-5 py-4 border-b border-zinc-200 dark:border-zinc-800/60">
+                <span class="font-bold text-sm">{appState.selectedSampleIds.length} Items Selected</span>
+                <button onclick={() => appState.selectedSampleIds = []} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white cursor-pointer"><X size={16} /></button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-3 space-y-1 no-scrollbar">
+
+                <span class="px-2 text-[10px] font-bold uppercase tracking-wider text-zinc-400">Add to...</span>
+                <div class="flex w-full items-center justify-between rounded-md px-2 py-1.5 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
+                    <div class="flex items-center gap-3 text-sm font-medium text-zinc-600 dark:text-zinc-400"><Heart size={16} /> Liked Folder</div>
+                    <button onclick={handleBulkLike} class="rounded border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer">Add</button>
+                </div>
+                <div class="my-2 border-t border-zinc-200 dark:border-zinc-800/50"></div>
+                {#each appState.collections as collection}
+                    <div class="flex w-full items-center justify-between rounded-md px-2 py-1.5 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/30">
+                        <div class="flex items-center gap-3 text-sm font-medium text-zinc-600 dark:text-zinc-400"><Folder size={16} /> {collection.name}</div>
+                        <button onclick={() => handleBulkAddToCollection(collection.id)} class="rounded border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 cursor-pointer">Add</button>
+                    </div>
+                {/each}
+                <div class="my-2 border-t border-zinc-200 dark:border-zinc-800/50"></div>
+                <button onclick={() => appState.isCreateCollectionModalOpen = true} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-100 transition-colors cursor-pointer"><Plus size={16} /> New Collection</button>
+
+                <div class="my-4 border-t border-zinc-200 dark:border-zinc-800/50"></div>
+                <div class="flex items-center justify-between px-2">
+                    <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Shared Tags</span>
+                    {#if isBulkTagging}<RefreshCw size={12} class="animate-spin text-zinc-400" />{/if}
+                </div>
+
+                <div class="px-2 mt-2">
+                    <div class="flex flex-wrap gap-1.5 mb-4 min-h-[24px]">
+                        {#each commonTags as tag}
+                            <div class="group relative flex items-center justify-center h-6 rounded-full border border-zinc-200 bg-zinc-50 px-2.5 text-[10px] font-semibold text-zinc-600 transition-all hover:pr-6 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-300 cursor-default overflow-hidden shadow-sm">
+                                <span>{tag.value}</span>
+                                <button onclick={() => handleBulkRemoveTag(tag.category, tag.value)} class="absolute right-1 opacity-0 group-hover:opacity-100 flex h-4 w-4 items-center justify-center rounded-full bg-zinc-200 text-zinc-600 hover:bg-red-500 hover:text-white dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-red-600 transition-all cursor-pointer"><X size={10} /></button>
+                            </div>
+                        {/each}
+                        {#if commonTags.length === 0}
+                            <span class="text-[10px] text-zinc-500 italic flex items-center h-6">No tags shared by all selected.</span>
+                        {/if}
+                    </div>
+
+                    <div class="relative bulk-tag-dropdown-container">
+                        <button onclick={(e) => { e.stopPropagation(); isBulkTagDropdownOpen = !isBulkTagDropdownOpen; }} class="flex w-full items-center justify-between rounded-md border border-zinc-300 bg-white px-3 py-2 text-xs font-semibold text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors cursor-pointer shadow-sm">
+                            <span class="flex items-center gap-2"><Plus size={14} /> Add Tag to All</span>
+                            <ChevronDown size={14} class="opacity-50" />
+                        </button>
+
+                        {#if isBulkTagDropdownOpen}
+                            <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-2 w-full flex-col rounded-lg border border-zinc-200 bg-white p-2 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                <input type="text" bind:value={bulkTagSearchQuery} placeholder="Search tags..." class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-xs focus:border-emerald-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-white transition-colors mb-2" autofocus />
+
+                                {#if bulkTagSearchQuery.trim() !== '' && !allAvailableTags.some(t => t.value.toLowerCase() === bulkTagSearchQuery.trim().toLowerCase())}
+                                    <button onclick={createNewBulkTag} class="w-full mb-2 flex items-center justify-center gap-1.5 rounded-md bg-emerald-50 text-emerald-600 px-2 py-1.5 text-xs font-bold hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:hover:bg-emerald-900/40 transition-colors cursor-pointer shadow-sm">
+                                        <Plus size={12} /> Create global Tag "{bulkTagSearchQuery}"
+                                    </button>
+                                {/if}
+
+                                <div class="max-h-48 overflow-y-auto no-scrollbar flex flex-col gap-0.5 border-t border-zinc-100 dark:border-zinc-800/50 pt-2">
+                                    {#each filteredBulkTags as tag}
+                                        <button
+                                                onclick={() => handleBulkAddTag(tag.category, tag.value)}
+                                                class="w-full text-left flex items-center justify-between rounded-md px-2 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors"
+                                        >
+                                            <span class="truncate pr-2">{tag.value}</span>
+                                            <span class="text-[8px] uppercase text-zinc-400 font-bold tracking-wider shrink-0">{tag.category}</span>
+                                        </button>
+                                    {/each}
+                                    {#if filteredBulkTags.length === 0 && bulkTagSearchQuery.trim() === ''}
+                                        <span class="text-xs text-zinc-500 italic p-2 text-center">No tags found.</span>
+                                    {/if}
+                                </div>
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            </div>
+        </div>
 
     </div>
 {:else if appState.currentView === 'projects'}
@@ -1403,13 +2323,156 @@
 {:else if appState.currentView === 'editor'}
     <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8">
     </div>
-
 {:else if appState.currentView === 'settings'}
-    <SettingsView bind:samples {allAvailableTags} {loadAllTags} />
+    <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8">
+        <h1 class="mb-8 text-3xl font-bold tracking-tight">Preferences</h1>
+        <div class="max-w-3xl">
+            {#if appState.activeSettingsTab === 'general'}
+                <div class="space-y-4">
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-200 dark:border-zinc-800/50 pb-2 mb-6">Appearance</h3>
+                    <label class="text-sm font-medium text-zinc-900 dark:text-zinc-100 block">Theme Preference</label>
+                    <div class="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/50 w-fit">
+                        <button onclick={() => setThemePref('light')} class="px-6 py-2 text-xs font-semibold rounded-md transition-all cursor-pointer {appState.themePreference === 'light' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Light</button>
+                        <button onclick={() => setThemePref('dark')} class="px-6 py-2 text-xs font-semibold rounded-md transition-all cursor-pointer {appState.themePreference === 'dark' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">Dark</button>
+                        <button onclick={() => setThemePref('system')} class="px-6 py-2 text-xs font-semibold rounded-md transition-all cursor-pointer {appState.themePreference === 'system' ? 'bg-white text-zinc-900 shadow-sm dark:bg-[#1f1f22] dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}">System</button>
+                    </div>
+                    <p class="text-xs text-zinc-500 pt-2">"System" automatically matches your Mac's appearance settings.</p>
+                </div>
+
+                <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-200 dark:border-zinc-800/50 pb-2 mb-6 mt-10">Playback</h3>
+
+                <div class="flex items-center justify-between">
+                    <div>
+                        <label class="text-sm font-medium text-zinc-900 dark:text-zinc-100 block">Auto-Play Selection</label>
+                        <p class="text-xs text-zinc-500 mt-1">Automatically play sounds when navigating the list with arrow keys.</p>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" bind:checked={appState.autoPlayEnabled} class="sr-only peer">
+                        <div class="w-11 h-6 bg-zinc-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-zinc-600 peer-checked:bg-emerald-500"></div>
+                    </label>
+                </div>
+            {:else if appState.activeSettingsTab === 'library'}
+                <div>
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-200 dark:border-zinc-800/50 pb-2 mb-6">Connected Folders</h3>
+                    {#if isSettingsLoading}
+                        <div class="flex h-20 items-center justify-center text-sm text-zinc-500 animate-pulse">Loading library data...</div>
+                    {:else if connectedFolders.length === 0}
+                        <div class="flex h-20 items-center justify-center rounded-md border border-dashed border-zinc-200 text-sm text-zinc-500 dark:border-zinc-800">No folders connected yet.</div>
+                    {:else}
+                        <div class="space-y-2">
+                            {#each connectedFolders as folder}
+                                <div class="flex items-center justify-between rounded-md border border-zinc-200 bg-white p-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/50">
+                                    <div class="flex flex-col overflow-hidden pr-4"><span class="truncate text-sm font-medium text-zinc-700 dark:text-zinc-300" title={folder}>{folder}</span></div>
+                                    <button onclick={() => handleRemoveFolder(folder)} disabled={isSettingsLoading} class="shrink-0 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100 transition-colors dark:border-red-900/30 dark:bg-red-900/10 dark:text-red-400 dark:hover:bg-red-900/20 cursor-pointer disabled:opacity-50">Un-link</button>
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                    <p class="mt-4 text-xs text-zinc-500">Un-linking a folder removes all its indexed samples from this application. It does not delete the actual files from your computer.</p>
+                    <div class="mt-12 border-t border-zinc-200 pt-8 dark:border-zinc-800/50">
+                        <h3 class="mb-4 text-xs font-bold uppercase tracking-wider text-red-500">Danger Zone</h3>
+                        <div class="flex items-center justify-between rounded-md border border-red-200 bg-red-50 p-4 dark:border-red-900/30 dark:bg-red-900/10">
+                            <div class="flex flex-col pr-4">
+                                <span class="text-sm font-bold text-red-700 dark:text-red-400">Clear Entire Library</span>
+                                <span class="text-xs text-red-600/80 dark:text-red-400/80 mt-1">This will instantly wipe all indexed samples and collections from your database. Your actual audio files on the hard drive remain untouched.</span>
+                            </div>
+                            <button onclick={handleClearDatabase} disabled={isSettingsLoading || isScanning} class="shrink-0 rounded-md bg-red-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-red-700 disabled:opacity-50 cursor-pointer shadow-sm">
+                                {#if isClearing} <RefreshCw size={14} class="animate-spin inline mr-1" /> Clearing... {:else} Clear Database {/if}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            {:else if appState.activeSettingsTab === 'audio'}
+                <div>
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-200 dark:border-zinc-800/50 pb-2 mb-6">Audio Engine</h3>
+                    <div class="flex h-32 items-center justify-center rounded-md border border-dashed border-zinc-200 text-sm text-zinc-500 dark:border-zinc-800">Audio Device Routing Options (Coming Soon)</div>
+                </div>
+            {:else if appState.activeSettingsTab === 'tags'}
+                <div>
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-200 dark:border-zinc-800/50 pb-2 mb-6">Tag Management</h3>
+
+                    <div class="space-y-2">
+                        {#each allAvailableTags.filter(t => t.category === 'User') as tag}
+                            <div class="flex items-center justify-between rounded-md border border-zinc-200 bg-white p-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/50">
+                                <div class="flex flex-col overflow-hidden pr-4">
+                                    <span class="truncate text-sm font-medium text-zinc-700 dark:text-zinc-300">{tag.value}</span>
+                                    <span class="text-[10px] uppercase text-zinc-500 font-bold tracking-wider mt-0.5">Global User Tag</span>
+                                </div>
+                                <button onclick={(e) => handleDeleteUserTag(tag.value, e)} class="shrink-0 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100 transition-colors dark:border-red-900/30 dark:bg-red-900/10 dark:text-red-400 dark:hover:bg-red-900/20 cursor-pointer shadow-sm">Delete</button>
+                            </div>
+                        {/each}
+
+                        {#if allAvailableTags.filter(t => t.category === 'User').length === 0}
+                            <div class="flex h-20 items-center justify-center rounded-md border border-dashed border-zinc-200 text-sm text-zinc-500 dark:border-zinc-800">No custom tags created yet.</div>
+                        {/if}
+                    </div>
+
+                    <p class="mt-4 text-xs text-zinc-500">Deleting a tag here will automatically remove it from all samples in your entire library. This action cannot be undone.</p>
+                </div>
+            {/if}
+        </div>
+    </div>
 {/if}
 
 {#if editingSample}
-    <MetadataEditor bind:editingSample bind:samples {allAvailableTags} {loadAllTags} />
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+        <div class="w-full max-w-md rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] p-6">
+            <h2 class="text-lg font-bold text-zinc-900 dark:text-zinc-100 mb-6">Edit Properties</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">Filename</label>
+                    <input type="text" bind:value={editForm.filename} class="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-zinc-900 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-zinc-100 transition-colors" />
+                </div>
+                <div class="flex gap-4">
+                    <div class="flex-1">
+                        <label class="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">BPM</label>
+                        <input type="number" bind:value={editForm.bpm} placeholder="e.g. 120" class="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-zinc-900 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-zinc-100 transition-colors" />
+                    </div>
+                    <div class="flex-1">
+                        <label class="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">Key</label>
+                        <input type="text" bind:value={editForm.key_signature} placeholder="e.g. F# min" class="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-zinc-900 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-zinc-100 transition-colors" />
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">Tags</label>
+                    <div class="flex flex-wrap gap-2 items-center min-h-[42px] rounded-md border border-zinc-300 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900 transition-colors">
+                        {#each editForm.tags as tag, i}
+                            <div class="group relative flex items-center justify-center h-6 rounded-full border border-zinc-200 bg-zinc-50 px-2.5 text-[11px] font-semibold text-zinc-600 transition-all hover:pr-6 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-300 cursor-default overflow-hidden shadow-sm">
+                                <span>{tag.value}</span>
+                                <button onclick={() => removeTagFromEditor(i)} class="absolute right-1 opacity-0 group-hover:opacity-100 flex h-4 w-4 items-center justify-center rounded-full bg-zinc-200 text-zinc-600 hover:bg-red-500 hover:text-white dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-red-600 transition-all cursor-pointer"><X size={10} /></button>
+                            </div>
+                        {/each}
+                        <div class="relative tag-dropdown-container">
+                            <button onclick={(e) => { e.stopPropagation(); isTagDropdownOpen = !isTagDropdownOpen; }} class="flex h-6 w-6 items-center justify-center rounded-full border border-dashed border-zinc-300 text-zinc-400 hover:border-zinc-500 hover:text-zinc-600 dark:border-zinc-600 dark:hover:border-zinc-400 dark:hover:text-zinc-300 transition-colors cursor-pointer"><Plus size={14} /></button>
+                            {#if isTagDropdownOpen}
+                                <div onclick={(e) => e.stopPropagation()} class="absolute left-0 top-full mt-2 w-72 flex-col rounded-lg border border-zinc-200 bg-white p-2 shadow-2xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
+                                    <input type="text" bind:value={tagSearchQuery} placeholder="Search or create tag..." class="w-full rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-xs focus:border-emerald-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-white transition-colors mb-2" />
+                                    {#if tagSearchQuery.trim() !== '' && !allAvailableTags.some(t => t.value.toLowerCase() === tagSearchQuery.toLowerCase())}
+                                        <button onclick={createNewTag} class="w-full mb-2 flex items-center justify-center gap-1.5 rounded-md bg-emerald-50 text-emerald-600 px-2 py-1.5 text-xs font-bold hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:hover:bg-emerald-900/40 transition-colors cursor-pointer"><Plus size={12} /> Create global Tag "{tagSearchQuery}"</button>
+                                    {/if}
+                                    <div class="max-h-60 overflow-y-auto no-scrollbar flex flex-col gap-0.5 border-t border-zinc-100 dark:border-zinc-800/50 pt-2">
+                                        {#each filteredTagsForEditor as tag}
+                                            <button
+                                                    onclick={() => addTagToEditor(tag.category, tag.value)}
+                                                    class="w-full text-left flex items-center justify-between rounded-md px-2 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors"
+                                            >
+                                                <span class="truncate pr-2">{tag.value}</span>
+                                                <span class="text-[8px] uppercase text-zinc-400 font-bold tracking-wider shrink-0">{tag.category}</span>
+                                            </button>
+                                        {/each}
+                                    </div>
+                                </div>
+                            {/if}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="mt-8 flex justify-end gap-3">
+                <button onclick={() => editingSample = null} class="px-4 py-2 text-sm font-semibold text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors cursor-pointer">Cancel</button>
+                <button onclick={saveMetadata} class="rounded-md bg-zinc-900 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white transition-colors cursor-pointer">Save Changes</button>
+            </div>
+        </div>
+    </div>
 {/if}
 
 {#if isSamplerOpen && samplerSample}
