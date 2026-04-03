@@ -4,12 +4,10 @@
 
     let {
         activeDropdownTags,
-        sortedAvailableTags,
         availableTags,
         loadSamples
     }: {
         activeDropdownTags: Array<{category: string, value: string}>,
-        sortedAvailableTags: Array<{category: string, value: string}>,
         availableTags: Array<{category: string, value: string}>,
         loadSamples: () => void
     } = $props();
@@ -112,6 +110,16 @@
     function handleOutsideClick() {
         openDropdown = null;
     }
+
+    // ENTERPRISE FIX: Die Sortierlogik passiert jetzt isoliert in der Komponente!
+    let sortedAvailableTags = $derived.by(() => {
+        return [...activeDropdownTags].sort((a, b) => {
+            const aActive = isTagActive(a.category, a.value) ? 1 : 0;
+            const bActive = isTagActive(b.category, b.value) ? 1 : 0;
+            if (aActive !== bActive) return bActive - aActive;
+            return 0;
+        });
+    });
 </script>
 
 <svelte:window onclick={handleOutsideClick} />
@@ -369,7 +377,7 @@
         </div>
     </div>
 
-    <div class="relative w-full">
+    <div class="relative w-full mt-3">
         <div class="flex w-full flex-wrap content-start items-start gap-2 pr-10 transition-all {isTagsExpanded ? 'h-auto pb-1' : 'h-6 overflow-hidden'}">
             {#each sortedAvailableTags as tag (tag.category + tag.value)}
                 <button onclick={() => toggleFilterTag(tag.category, tag.value)} class="shrink-0 flex items-center h-6 rounded-full border px-3 text-[11px] font-semibold cursor-pointer transition-colors {isTagActive(tag.category, tag.value) ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900' : 'border-zinc-200 bg-zinc-50 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-[#18181b] dark:text-zinc-400 dark:hover:bg-zinc-800'}">{tag.value} {#if isTagActive(tag.category, tag.value)}<span class="ml-1.5 opacity-50 font-normal hover:opacity-100">✕</span>{/if}</button>

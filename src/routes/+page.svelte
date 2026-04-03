@@ -1,42 +1,35 @@
 <script lang="ts">
-    import type { SampleRecord, PaginatedResponse, ScanProgressPayload } from '$lib/types';
-    import { formatDuration } from '$lib/utils/format';
-    import { parseTags } from '$lib/utils/tags';
-    import { getSemitoneShift } from '$lib/utils/audio';
+    import type { SampleRecord, PaginatedResponse } from '$lib/types';
+    import { parseTags, BASE_TAGS } from '$lib/utils/tags';
+    import { getSemitoneShift, getStretchRatio } from '$lib/utils/audio';
+    import { initDragDrop } from '$lib/utils/drag';
+
     import SettingsView from '$lib/components/settings/SettingsView.svelte';
     import MetadataEditor from '$lib/components/editor/MetadataEditor.svelte';
     import Pagination from '$lib/components/browser/Pagination.svelte';
     import BulkSidebar from '$lib/components/browser/BulkSidebar.svelte';
     import FilterMenu from '$lib/components/browser/FilterMenu.svelte';
-    import { parseWaveform } from '$lib/utils/format';
-    import { getStretchRatio } from '$lib/utils/audio';
+    import SortMenu from '$lib/components/browser/SortMenu.svelte';
+    import SampleRow from '$lib/components/browser/SampleRow.svelte';
+    import SamplerModal from '$lib/components/editor/SamplerModal.svelte';
+    import CollectionsGrid from '$lib/components/browser/CollectionsGrid.svelte';
+    import EmptyLibrary from '$lib/components/browser/EmptyLibrary.svelte';
+    import ScannerControls from '$lib/components/browser/ScannerControls.svelte';
+
+    import { appState } from '$lib/store.svelte';
+    import { initScannerListener } from '$lib/stores/scanner.svelte';
+    import { editorState, openSampler } from '$lib/stores/editor.svelte';
 
     import { onMount, onDestroy, tick } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
-    import { convertFileSrc } from '@tauri-apps/api/core';
-    import { appDataDir } from '@tauri-apps/api/path';
-    import { open, ask } from '@tauri-apps/plugin-dialog';
-    import { writeFile, mkdir } from '@tauri-apps/plugin-fs';
-    import { EllipsisVertical, Download, Heart, Play, Pause, FolderPlus, RefreshCw, Trash2, Image as ImageIcon, ChevronLeft, ChevronRight, Settings, X, ChevronDown, ArrowDownUp, Shuffle, Folder, Plus, Music2, Repeat, Gauge, Search, Library, ZoomIn, ZoomOut } from 'lucide-svelte';
-    import { FastForward, Rewind } from 'lucide-svelte';
-    import { appState } from '$lib/store.svelte';
-    import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
-    // --- SORT STATE ---
     let sortField: 'name' | 'type' | 'pack' | 'random' = $state('name');
     let sortOrder: 'asc' | 'desc' = $state('asc');
-    let isSortDropdownOpen = $state(false);
 
     let samples: SampleRecord[] = $state([]);
     let isLoading: boolean = $state(true);
 
-    let selectedPath: string | null = $state(null);
-
-    let activeTypeFilter: string | null = $state(null);
-
-    // --- ENTERPRISE EMPTY STATE LOGIC ---
-    // Überwacht reaktiv, ob der User aktiv sucht oder filtert
     let hasActiveFilters = $derived(
         appState.globalSearchQuery.trim() !== '' ||
         appState.filters.instruments.length > 0 ||
@@ -50,87 +43,54 @@
         appState.filters.collectionId !== null
     );
 
-    let scrollContainer: HTMLDivElement;
+    let scrollContainer: HTMLDivElement | undefined = $state();
 
     let currentPage: number = $state(1);
     const pageSize: number = 50;
     let totalItems: number = $state(0);
     let totalPages: number = $derived(Math.ceil(totalItems / pageSize) || 1);
 
-    // --- AUDIO STATE (Refactored to Rust Backend) ---
     let playingId: string | null = $state(null);
     let selectedId: string | null = $state(null);
 
-    let playbackProgress: number = $state(0);
     let currentSampleDuration: number = 0;
-    // Captured at playback start — actual duration = currentSampleDuration / currentStretchRatio.
-    // Keeps animation in sync with the time-stretched audio.
     let currentStretchRatio: number = 1.0;
     let playbackStartTime: number = 0;
     let animationFrameId: number;
 
-    // --- TAGS LOGIC (Richtig sortiert für den Compiler) ---
-    const BASE_TAGS = [
-        { category: 'Drums', value: 'Drums' },
-        { category: 'Drums', value: 'Kick' },
-        { category: 'Drums', value: 'Snare' },
-        { category: 'Percussion', value: 'Percussion' },
-        { category: 'Synth', value: 'Synth' },
-        { category: 'Bass', value: '808' },
-        { category: 'Genre', value: 'Trap' },
-        { category: 'Genre', value: 'Afrobeats' },
-        { category: 'Genre', value: 'House' },
-        { category: 'Format', value: 'One-Shot' },
-        { category: 'Format', value: 'Loop' },
-    ];
+    let availableTags = $state([...BASE_TAGS]);
+    let allAvailableTags: Array<{category: string, value: string}> = $state([]);
 
-    // Initialer State nimmt die Base-Tags, wird später von Rust überschrieben
-    let availableTags: Array<{category: string, value: string}> = $state([...BASE_TAGS]);
-
-    // ENTERPRISE FIX: Intelligenter Tag-Merge
     let activeDropdownTags = $derived.by(() => {
         if (appState.filters.tagMatchMode === 'OR') {
-            // Im "Either" Modus: Wir vereinen unsere festen Basis-Tags mit den
-            // Tags aus der Datenbank und filtern alle doppelten Einträge sauber heraus.
             const combined = [...BASE_TAGS, ...allAvailableTags];
             return combined.filter((tag, index, self) =>
                 index === self.findIndex((t) => t.category === tag.category && t.value === tag.value)
             );
         } else {
-            // Im "Both" Modus: Wir zeigen streng nur das, was die aktuelle Suche hergibt
             return availableTags;
         }
     });
-
-    let userTags: Array<{category: string, value: string}> = $state([]);
-
-    // --- PROGRESS BAR STATE ---
-    let scanTotal: number = $state(0);
-    let scanCurrent: number = $state(0);
-    let scanCurrentFile: string = $state('');
-    let scanPercentage = $derived(scanTotal > 0 ? Math.round((scanCurrent / scanTotal) * 100) : 0);
 
     function updateProgress() {
         if (appState.isPlaying) {
             const elapsed = (performance.now() - playbackStartTime) / 1000;
 
-            if (isSamplerOpen && samplerSample) {
-                // ENTERPRISE FIX: Division durch appState.vinylSpeedMode hält die Animation synchron!
-                const selectionDurationSec = ((samplerSample.duration_ms * (trimEndPct - trimStartPct)) / 1000 / currentStretchRatio) / appState.vinylSpeedMode;
+            if (editorState.isOpen && editorState.sample) {
+                const selectionDurationSec = ((editorState.sample.duration_ms * (editorState.trimEndPct - editorState.trimStartPct)) / 1000 / currentStretchRatio) / appState.vinylSpeedMode;
 
                 if (elapsed >= selectionDurationSec) {
-                    if (isLooping && currentPreviewPath) {
+                    if (editorState.isLooping && editorState.currentPreviewPath) {
                         playbackStartTime = performance.now();
                         appState.playbackProgress = 0;
-                        currentStretchRatio = samplerSample ? getStretchRatio(samplerSample) : 1.0;
+                        currentStretchRatio = getStretchRatio(editorState.sample.bpm, appState.globalBpm);
 
                         let semitones = 0;
-                        if (appState.globalKey && samplerSample.key_signature) {
-                            semitones = getSemitoneShift(samplerSample.key_signature, appState.globalKey, appState.globalKeyMode);
+                        if (appState.globalKey && editorState.sample.key_signature) {
+                            semitones = getSemitoneShift(editorState.sample.key_signature, appState.globalKey, appState.globalKeyMode);
                         }
 
-                        // Übergibt den Speed an den Rust-Loop
-                        invoke('play_audio', { filePath: currentPreviewPath, semitones, stretchRatio: currentStretchRatio, volume: appState.globalVolume, speed: appState.vinylSpeedMode }).catch(console.error);
+                        invoke('play_audio', { filePath: editorState.currentPreviewPath, semitones, stretchRatio: currentStretchRatio, volume: appState.globalVolume, speed: appState.vinylSpeedMode }).catch(console.error);
                         animationFrameId = requestAnimationFrame(updateProgress);
                     } else {
                         appState.playbackProgress = 1.0;
@@ -167,41 +127,15 @@
         loadSamples();
     }
 
-    async function loadUserTags() {
-        try {
-            userTags = await invoke('get_user_tags');
-        } catch (e) { console.error(e); }
-    }
-
-    // Globaler Click Handler (Muss VOR onMount definiert sein)
-    const handleGlobalClick = (e: MouseEvent) => {
-        openDropdown = null;
-        isSortDropdownOpen = false;
+    const handleGlobalClick = () => {
         openContextMenuId = null;
-        isQueueDropdownOpen = false;
-        if (isTagDropdownOpen) {
-            const target = e.target as HTMLElement;
-            if (!target.closest('.tag-dropdown-container')) {
-                isTagDropdownOpen = false;
-            }
-        }
     };
 
     onMount(async () => {
-        // @ts-ignore
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-
-        // appDataDir einmalig auflösen und drag-icons Unterordner anlegen.
-        appDataDir().then(async dir => {
-            _appDataPath = dir.endsWith('/') || dir.endsWith('\\') ? dir : dir + '/';
-            try { await mkdir(_appDataPath + 'drag-icons', { recursive: true }); } catch { /* existiert bereits */ }
-        }).catch(e => console.warn('[SampleVault] appDataDir nicht aufgelöst:', e));
-
+        initDragDrop();
         window.addEventListener('keydown', handleKeydown);
         window.addEventListener('click', handleGlobalClick);
         window.addEventListener('trigger-sample-reload', handleSampleReload);
-        window.addEventListener('mousemove', handleEditorMouseMove);
-        window.addEventListener('mouseup', handleEditorMouseUp);
         window.addEventListener('force-retrigger', handleForceRetrigger);
 
         try {
@@ -210,21 +144,15 @@
         } catch (e) { console.error(e); }
 
         await loadAllTags();
-
         await listen('library-updated', () => loadSamples());
-        await listen<ScanProgressPayload>('scan-progress', (e) => {
-            scanTotal = e.payload.total; scanCurrent = e.payload.current; scanCurrentFile = e.payload.current_file;
-        });
+        await initScannerListener();
     });
 
     onDestroy(() => {
         cancelAnimationFrame(animationFrameId);
-
         window.removeEventListener('keydown', handleKeydown);
         window.removeEventListener('click', handleGlobalClick);
         window.removeEventListener('trigger-sample-reload', handleSampleReload);
-        window.removeEventListener('mousemove', handleEditorMouseMove);
-        window.removeEventListener('mouseup', handleEditorMouseUp);
         window.removeEventListener('force-retrigger', handleForceRetrigger);
     });
 
@@ -236,13 +164,10 @@
     $effect(() => {
         if (appState.cmdTogglePlay > lastToggle) {
             lastToggle = appState.cmdTogglePlay;
-
-            // ENTERPRISE FIX: Wenn Sampler offen, ignoriere die normale Liste und toggle das Preview!
-            if (isSamplerOpen) {
+            if (editorState.isOpen) {
                 playSlicePreview();
                 return;
             }
-
             if (appState.currentSample) {
                 if (appState.isPlaying) {
                     invoke('stop_audio').catch(e => console.error(e));
@@ -272,7 +197,6 @@
         event.stopPropagation();
         const originalState = sample.is_liked;
         const newState = !originalState;
-
         sample.is_liked = newState;
 
         if (appState.filters.onlyLiked && !newState) {
@@ -303,17 +227,19 @@
             });
             samples = response.samples;
             totalItems = response.total_count;
-            if(response.available_tags) availableTags = response.available_tags;
+            if (response.available_tags) availableTags = response.available_tags;
 
             if (scrollContainer) scrollContainer.scrollTop = 0;
-            if (sourceNode) { sourceNode.stop(); playingId = null; }
+            if (playingId === null && appState.isPlaying) {
+                invoke('stop_audio').catch(console.error);
+                appState.isPlaying = false;
+            }
         } catch (error) { console.error(error); } finally { isLoading = false; }
     }
 
     async function playNextSample() {
         if (samples.length === 0) return;
         let currentIndex = samples.findIndex(s => s.id === selectedId);
-
         if (currentIndex === -1) currentIndex = 0;
         else if (currentIndex === samples.length - 1) {
             if (currentPage < totalPages) {
@@ -325,7 +251,6 @@
             }
             return;
         } else currentIndex++;
-
         await handlePlayRequest(samples[currentIndex]);
         setTimeout(() => scrollToSample(samples[currentIndex].id), 50);
     }
@@ -333,7 +258,6 @@
     async function playPrevSample() {
         if (samples.length === 0) return;
         let currentIndex = samples.findIndex(s => s.id === selectedId);
-
         if (currentIndex === -1) currentIndex = samples.length - 1;
         else if (currentIndex === 0) {
             if (currentPage > 1) {
@@ -345,57 +269,26 @@
             }
             return;
         } else currentIndex--;
-
         await handlePlayRequest(samples[currentIndex]);
         setTimeout(() => scrollToSample(samples[currentIndex].id), 50);
     }
 
-    // --- ENTERPRISE SCROLL LOGIC ---
-    // Scrollt nur auf der vertikalen Achse (Y) und verhindert das horizontale Verschieben des Layouts
     function scrollToSample(id: string) {
         const el = document.getElementById(`sample-${id}`);
         if (!el || !scrollContainer) return;
-
         const elRect = el.getBoundingClientRect();
         const containerRect = scrollContainer.getBoundingClientRect();
-
-        // Prüfen, ob das Element oben oder unten aus dem sichtbaren Bereich ragt
-        if (elRect.top < containerRect.top) {
-            scrollContainer.scrollBy({ top: elRect.top - containerRect.top - 20, behavior: 'smooth' });
-        } else if (elRect.bottom > containerRect.bottom) {
-            scrollContainer.scrollBy({ top: elRect.bottom - containerRect.bottom + 20, behavior: 'smooth' });
-        }
+        if (elRect.top < containerRect.top) scrollContainer.scrollBy({ top: elRect.top - containerRect.top - 20, behavior: 'smooth' });
+        else if (elRect.bottom > containerRect.bottom) scrollContainer.scrollBy({ top: elRect.bottom - containerRect.bottom + 20, behavior: 'smooth' });
     }
 
     async function handleKeydown(e: KeyboardEvent) {
-        // Ignoriere Tastenkürzel, wenn der Nutzer in einem Suchfeld tippt
         if (document.activeElement?.tagName === 'INPUT') return;
 
-        if (isSamplerOpen) {
-            // ArrowLeft ignoriert das Blockieren und wird zum Retrigger!
-            if (['ArrowDown', 'ArrowUp', 'ArrowRight'].includes(e.key)) {
-                e.preventDefault();
-                return;
-            }
-
-            // ENTERPRISE FIX: ArrowLeft fungiert als MPC "CUE"-Trigger.
-            // Es startet das Preview in 0ms komplett von vorn, egal ob es gerade läuft!
-            if (e.key === 'ArrowLeft') {
-                e.preventDefault();
-                playSlicePreview(true);
-                return;
-            }
-
-            if (e.key === ' ') {
-                e.preventDefault();
-                playSlicePreview();
-                return;
-            }
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                closeSampler();
-                return;
-            }
+        if (editorState.isOpen) {
+            if (['ArrowDown', 'ArrowUp', 'ArrowRight'].includes(e.key)) { e.preventDefault(); return; }
+            if (e.key === 'ArrowLeft') { e.preventDefault(); playSlicePreview(true); return; }
+            if (e.key === ' ') { e.preventDefault(); playSlicePreview(); return; }
             return;
         }
 
@@ -415,14 +308,9 @@
                     if (currentPage < totalPages) {
                         currentPage++; await loadSamples();
                         if (samples.length > 0) {
-                            // ENTERPRISE FIX: Auto-Play Prüfung auch beim Seitenwechsel
-                            if (appState.autoPlayEnabled !== false) {
-                                await handlePlayRequest(samples[0]);
-                            } else {
-                                selectedId = samples[0].id;
-                            }
-                            await tick();
-                            scrollToSample(samples[0].id);
+                            if (appState.autoPlayEnabled !== false) await handlePlayRequest(samples[0]);
+                            else selectedId = samples[0].id;
+                            await tick(); scrollToSample(samples[0].id);
                         }
                     }
                     return;
@@ -433,14 +321,9 @@
                     if (currentPage > 1) {
                         currentPage--; await loadSamples();
                         if (samples.length > 0) {
-                            // ENTERPRISE FIX: Auto-Play Prüfung auch beim Seitenwechsel
-                            if (appState.autoPlayEnabled !== false) {
-                                await handlePlayRequest(samples[samples.length - 1]);
-                            } else {
-                                selectedId = samples[samples.length - 1].id;
-                            }
-                            await tick();
-                            scrollToSample(samples[samples.length - 1].id);
+                            if (appState.autoPlayEnabled !== false) await handlePlayRequest(samples[samples.length - 1]);
+                            else selectedId = samples[samples.length - 1].id;
+                            await tick(); scrollToSample(samples[samples.length - 1].id);
                         }
                     }
                     return;
@@ -448,18 +331,10 @@
             }
 
             const nextSample = samples[currentIndex];
+            if (appState.autoPlayEnabled !== false) handlePlayRequest(nextSample);
+            else selectedId = nextSample.id;
 
-            // ENTERPRISE FIX: Respektiert die Auto-Play Einstellung für das normale Scrollen
-            if (appState.autoPlayEnabled !== false) {
-                handlePlayRequest(nextSample);
-            } else {
-                // Wenn Auto-Play aus ist, wird nur die Zeile markiert, aber nicht abgespielt
-                selectedId = nextSample.id;
-            }
-
-            await tick();
-            scrollToSample(nextSample.id);
-
+            await tick(); scrollToSample(nextSample.id);
         } else if (e.key === 'ArrowLeft') {
             e.preventDefault();
             if (!selectedId) return;
@@ -492,14 +367,9 @@
 
         let semitones = 0;
         if (appState.globalKey && sample.key_signature) {
-            // Relative-Key-Logik: globalKeyMode bestimmt ob Dur- oder Moll-Samples
-            // auf den Relativ-Key gepitched werden (gleiche Skala, anderer Startpunkt).
             semitones = getSemitoneShift(sample.key_signature, appState.globalKey, appState.globalKeyMode);
         }
-
-        // BPM Stretcher: time-stretch sample to globalBpm without changing pitch.
-        // Ratio 1.0 = identity (ssstretch fast-path, no processing overhead).
-        const stretchRatio = getStretchRatio(sample);
+        const stretchRatio = getStretchRatio(sample.bpm, appState.globalBpm);
 
         currentSampleDuration = (sample.duration_ms / 1000) / appState.vinylSpeedMode;
         currentStretchRatio = stretchRatio;
@@ -522,87 +392,57 @@
         }
     }
 
-    function toggleFilter(type: string) { activeTypeFilter = activeTypeFilter === type ? null : type; currentPage = 1; loadSamples(); }
+    async function playSlicePreview(forceRestart = false) {
+        if (!editorState.sample) return;
 
-    // --- BATCH SCANNING QUEUE ---
-    let scanQueue: string[] = $state([]);
-    let isQueueDropdownOpen = $state(false);
-
-    let isSyncing: boolean = $state(false);
-    let isScanningNew: boolean = $state(false);
-    let isClearing: boolean = $state(false);
-    let isScanning = $derived(isSyncing || isScanningNew || isClearing);
-    let scanMessage: string = $state('');
-
-    async function handleSelectFolder() {
-        try {
-            // Enterprise: Wir erlauben direkt die Mehrfachauswahl im OS-Dialog!
-            const result = await open({ directory: true, multiple: true });
-            if (result) {
-                let added = 0;
-                if (Array.isArray(result)) {
-                    for (const path of result) {
-                        if (!scanQueue.includes(path)) {
-                            scanQueue = [...scanQueue, path];
-                            added++;
-                        }
-                    }
-                } else {
-                    if (!scanQueue.includes(result as string)) {
-                        scanQueue = [...scanQueue, result as string];
-                        added++;
-                    }
-                }
-                if (added > 0) scanMessage = `${added} folder(s) added to queue.`;
-            }
-        } catch (error) { console.error(error); }
-    }
-
-    async function handleScan() {
-        if (scanQueue.length === 0) return;
-        isScanningNew = true;
-        let totalAdded = 0;
-
-        // Kopiere die Queue, um sie abzuarbeiten
-        const queueToProcess = [...scanQueue];
-
-        for (const path of queueToProcess) {
-            scanMessage = `Indexing ${path.split(/[/\\]/).pop()}...`;
-            try {
-                const count = await invoke<number>('scan_library', { path });
-                totalAdded += count;
-                // Ordner erfolgreich gescannt -> aus der Liste entfernen
-                scanQueue = scanQueue.filter(p => p !== path);
-            } catch (error) {
-                console.error(`Error scanning ${path}:`, error);
-            }
+        if (appState.isPlaying && !forceRestart) {
+            invoke('stop_audio').catch(console.error);
+            appState.isPlaying = false;
+            cancelAnimationFrame(animationFrameId);
+            return;
         }
 
-        scanMessage = `Batch complete. Added ${totalAdded} files in total.`;
-        currentPage = 1;
-        await loadSamples();
-        isScanningNew = false;
+        if (editorState.isSlicing && !editorState.currentPreviewPath) return;
 
-        setTimeout(() => { if (!isScanningNew) scanMessage = ''; }, 4000);
+        if (!editorState.isSliceReady && (!editorState.currentPreviewPath || editorState.previewSliceStartPct !== editorState.trimStartPct)) {
+            editorState.isSlicing = true;
+            try {
+                const startMs = editorState.trimStartPct * editorState.sample.duration_ms;
+                const endMs = editorState.sample.duration_ms;
+                editorState.currentPreviewPath = await invoke<string>('slice_audio', {
+                    path: editorState.sample.original_path,
+                    startMs, endMs
+                });
+                editorState.previewSliceStartPct = editorState.trimStartPct;
+            } catch (e) { console.error("Preview error:", e); return; }
+            finally { editorState.isSlicing = false; }
+        }
+
+        if (editorState.currentPreviewPath) {
+            let semitones = 0;
+            if (appState.globalKey && editorState.sample.key_signature) {
+                semitones = getSemitoneShift(editorState.sample.key_signature, appState.globalKey, appState.globalKeyMode);
+            }
+            try {
+                if (appState.isPlaying) await invoke('stop_audio');
+                await invoke('play_audio', {
+                    filePath: editorState.currentPreviewPath,
+                    semitones, stretchRatio: getStretchRatio(editorState.sample.bpm, appState.globalBpm),
+                    volume: appState.globalVolume, speed: appState.vinylSpeedMode
+                });
+                appState.isPlaying = true;
+                playbackStartTime = performance.now();
+                animationFrameId = requestAnimationFrame(updateProgress);
+            } catch (error) { console.error(error); }
+        }
     }
 
-    async function handleRescanAll() {
-        isSyncing = true;
-        scanMessage = 'Syncing folders...';
-        try {
-            const removed = await invoke<number>('cleanup_database');
-            const added = await invoke<number>('rescan_all_folders');
-            scanMessage = `Synced! Added: ${added}, Removed: ${removed}`;
-            currentPage = 1;
-            await loadSamples();
-            setTimeout(() => { scanMessage = ''; }, 3000);
-        } catch (error) { scanMessage = `Error: ${error}`; }
-        finally { isSyncing = false; }
+    function handleForceRetrigger() {
+        if (appState.currentSample && appState.isPlaying) {
+            if (editorState.isOpen) playSlicePreview(true);
+            else handlePlayRequest(appState.currentSample, true);
+        }
     }
-
-    let _appDataPath = '';
-
-    $effect(() => { if (appState.currentView === 'settings') loadConnectedFolders(); });
 
     function toggleSampleSelection(id: string, checked: boolean) {
         if (checked) {
@@ -612,494 +452,18 @@
         }
     }
 
-    // --- CONTEXT MENU & EDITOR STATE ---
     let openContextMenuId: string | null = $state(null);
     let editingSample: SampleRecord | null = $state(null);
 
     function openEditModal(sample: SampleRecord) {
         editingSample = sample;
-        editForm = { filename: sample.filename, bpm: sample.bpm, key_signature: sample.key_signature || '', tags: parseTags(sample.tags) };
-        openContextMenuId = null; isTagDropdownOpen = false; tagSearchQuery = '';
+        openContextMenuId = null;
     }
 
-    // --- TAGS LOGIC ---
-    let allAvailableTags: Array<{category: string, value: string}> = $state([]);
-    let tagSearchQuery: string = $state('');
-
-    let filteredTagsForEditor = $derived(
-        allAvailableTags.filter(t => t.value.toLowerCase().includes(tagSearchQuery.toLowerCase()))
-    );
-
-    // Diese Funktion lädt nun das KOMPLETTE Lexikon (System + User) aus Rust
     async function loadAllTags() {
         try {
             allAvailableTags = await invoke('get_all_available_tags');
         } catch (e) { console.error(e); }
-    }
-
-    // Cache: sample.id → absoluter Pfad zum 64×64 Drag-Icon PNG
-    const _dragIconCache = new Map<string, string>();
-
-    /**
-     * Erzeugt ein 64×64 PNG für den OS-Drag und cached es im appDataDir.
-     * - Cover vorhanden → Cover auf 64×64 verkleinert (kein riesiges Bild mehr am Cursor)
-     * - Kein Cover → generiertes Music-Note-Icon (dunkel + Emerald)
-     *
-     * Das Icon wird beim mousedown PARALLEL zur Drag-Geste erzeugt — by the time
-     * der User 5px bewegt hat, ist es fertig. Kein spürbarer Overhead.
-     */
-    async function prepareDragIcon(sample: SampleRecord): Promise<string> {
-        if (_dragIconCache.has(sample.id)) return _dragIconCache.get(sample.id)!;
-        if (!_appDataPath) return '';
-
-        const SIZE = 64;
-        const canvas = document.createElement('canvas');
-        canvas.width = SIZE; canvas.height = SIZE;
-        const ctx = canvas.getContext('2d')!;
-
-        let drewCover = false;
-        if (sample.cover_path) {
-            try {
-                // WICHTIG: img.src = convertFileSrc(...) → asset://localhost/ Origin →
-                // Canvas wird "tainted" → toBlob() wirft SecurityError.
-                // Fix: Bild per fetch() als Blob laden → createObjectURL() erzeugt eine
-                // blob:-URL (same-origin) → kein Taint → toBlob() funktioniert.
-                const response = await fetch(convertFileSrc(sample.cover_path!));
-                if (response.ok) {
-                    const imgBlob   = await response.blob();
-                    const objectUrl = URL.createObjectURL(imgBlob);
-                    const img       = new Image();
-                    await new Promise<void>((resolve) => {
-                        img.onload  = () => resolve();
-                        img.onerror = () => resolve();
-                        img.src     = objectUrl;
-                    });
-                    URL.revokeObjectURL(objectUrl); // Sofort freigeben
-                    if (img.naturalWidth > 0) {
-                        ctx.save();
-                        ctx.beginPath();
-                        if (ctx.roundRect) ctx.roundRect(0, 0, SIZE, SIZE, 10);
-                        else ctx.rect(0, 0, SIZE, SIZE); // Fallback für ältere WebViews
-                        ctx.clip();
-                        ctx.drawImage(img, 0, 0, SIZE, SIZE);
-                        ctx.restore();
-                        drewCover = true;
-                    }
-                }
-            } catch { /* Fehler → Fallback-Icon */ }
-        }
-
-        if (!drewCover) {
-            // Generiertes Icon: dunkler Hintergrund + Emerald Music-Note
-            ctx.fillStyle = '#27272a';
-            ctx.beginPath();
-            if (ctx.roundRect) ctx.roundRect(0, 0, SIZE, SIZE, 10);
-            else ctx.rect(0, 0, SIZE, SIZE);
-            ctx.fill();
-            ctx.fillStyle = '#22c55e';
-            ctx.font = 'bold 38px serif';
-            ctx.textAlign    = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('♪', SIZE / 2, SIZE / 2 + 2);
-        }
-
-        // Canvas → PNG-Bytes → Datei
-        const blob  = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const iconPath = _appDataPath + 'drag-icons/' + sample.id + '.png';
-
-        await writeFile(iconPath, bytes);
-        _dragIconCache.set(sample.id, iconPath);
-        return iconPath;
-    }
-
-    // --- ENTERPRISE OS-DRAG & DROP ---
-    // Kommuniziert direkt mit dem OS via @crabnebula/tauri-plugin-drag.
-    // Umgeht den Browser-Drag komplett — der User kann das Sample in seine DAW ziehen.
-    //
-    // Icon-Strategie:
-    //   prepareDragIcon() erzeugt beim mousedown PARALLEL ein 64×64 PNG (Cover oder
-    //   generiertes Music-Note-Icon). By the time der User 5px bewegt hat, ist das
-    //   Icon bereits fertig im Cache. Kein Overhead, kein riesiges Bild mehr am Cursor.
-    function nativeDrag(node: HTMLElement, sampleArg: SampleRecord) {
-        let sample     = sampleArg;
-        let startX     = 0;
-        let startY     = 0;
-        let isDragging = false;                      // Guard gegen parallele startDrag()-Aufrufe
-        let didDrag    = false;                      // Swallowed den nächsten click nach Drag
-        let iconPromise: Promise<string> | null = null; // Startet beim mousedown, await im move
-
-        const handleMouseMove = async (e: MouseEvent) => {
-            if (isDragging) return;
-
-            const dx = Math.abs(e.clientX - startX);
-            const dy = Math.abs(e.clientY - startY);
-
-            if (dx > 5 || dy > 5) {
-                isDragging = true;
-                cleanupWindowListeners();
-
-                try {
-                    // Icon wurde bereits beim mousedown vorbereitet — meistens schon fertig.
-                    const icon = await (iconPromise ?? prepareDragIcon(sample));
-                    await startDrag({ item: [sample.original_path], icon });
-                    didDrag = true;
-                } catch (err) {
-                    console.error('[SampleVault] OS-Drag fehlgeschlagen:', err);
-                } finally {
-                    isDragging = false;
-                }
-            }
-        };
-
-        const handleMouseUp = () => {
-            cleanupWindowListeners();
-        };
-
-        // Unterdrückt den click-Event der nach mousedown+mouseup noch gefeuert wird —
-        // verhindert versehentliche Sample-Wiedergabe oder Selektion nach einem Drag.
-        const handleClick = (e: MouseEvent) => {
-            if (didDrag) {
-                e.stopPropagation();
-                e.preventDefault();
-                didDrag = false;
-            }
-        };
-
-        const cleanupWindowListeners = () => {
-            window.removeEventListener('mousemove', handleMouseMove);
-            window.removeEventListener('mouseup', handleMouseUp);
-        };
-
-        const handleMouseDown = (e: MouseEvent) => {
-            if (e.button !== 0) return; // Nur Linksklick
-
-            // preventDefault verhindert Browser-Standard-Drag (Text-Selektion, Image-Ghost).
-            e.preventDefault();
-
-            startX      = e.clientX;
-            startY      = e.clientY;
-            isDragging  = false;
-            didDrag     = false;
-
-            // Icon parallel starten — während der User 5px bewegt, wird das PNG generiert.
-            // .catch(() => '') damit ein Fehler den Drag nicht blockiert.
-            iconPromise = prepareDragIcon(sample).catch(() => '');
-
-            window.addEventListener('mousemove', handleMouseMove);
-            window.addEventListener('mouseup',   handleMouseUp);
-        };
-
-        node.addEventListener('mousedown', handleMouseDown);
-        node.addEventListener('click',     handleClick);
-
-        return {
-            update(newSample: SampleRecord) {
-                sample      = newSample;
-                iconPromise = null; // Cache-Referenz zurücksetzen — neues Sample, neues Icon
-            },
-            destroy() {
-                node.removeEventListener('mousedown', handleMouseDown);
-                node.removeEventListener('click',     handleClick);
-                cleanupWindowListeners();
-            }
-        };
-    }
-
-    // --- ENTERPRISE WAVEFORM ZOOM & CLICK ---
-    let editorZoomLevel = $state(1.0);
-    let editorScrollContainer: HTMLDivElement;
-
-    function handleZoomIn() {
-        editorZoomLevel = Math.min(10.0, editorZoomLevel * 1.5);
-    }
-
-    function handleZoomOut() {
-        editorZoomLevel = Math.max(1.0, editorZoomLevel / 1.5);
-    }
-
-    // Die neue Funktion für das Click-to-Snap Feature
-    function handleWaveformClick(e: MouseEvent) {
-        if (isSliceReady || !editorWaveformContainer) return;
-
-        const rect = editorWaveformContainer.getBoundingClientRect();
-        let pct = (e.clientX - rect.left) / rect.width;
-        pct = Math.max(0, Math.min(1, pct));
-
-        // Spaltet den Editor logisch in zwei Hälften (0.5).
-        // Klick links = Start-Locator springt. Klick rechts = End-Locator springt.
-        if (pct < 0.5) {
-            trimStartPct = Math.min(pct, trimEndPct - 0.02);
-            currentPreviewPath = null;
-            if (appState.isPlaying) playSlicePreview(true);
-        } else {
-            trimEndPct = Math.max(pct, trimStartPct + 0.02);
-        }
-    }
-
-    function editorWheelZoom(node: HTMLElement) {
-        const handleWheel = (e: WheelEvent) => {
-            if (e.ctrlKey || e.metaKey) {
-                e.preventDefault();
-
-                if (!editorScrollContainer || !editorWaveformContainer) return;
-
-                const zoomFactor = 1.1;
-                const isZoomingIn = e.deltaY < 0;
-                const oldZoom = editorZoomLevel;
-
-                let newZoom = isZoomingIn ? oldZoom * zoomFactor : oldZoom / zoomFactor;
-                // ENTERPRISE FIX: Max Zoom auf 10x limitiert (verhindert den "Grünen Block"-Fehler)
-                newZoom = Math.max(1.0, Math.min(10.0, newZoom));
-
-                if (newZoom === oldZoom) return;
-
-                const rect = editorWaveformContainer.getBoundingClientRect();
-                const mouseXRel = e.clientX - rect.left;
-                const mousePct = mouseXRel / rect.width;
-
-                editorZoomLevel = newZoom;
-
-                tick().then(() => {
-                    const newRect = editorWaveformContainer.getBoundingClientRect();
-                    const newMouseXRel = mousePct * newRect.width;
-                    const scrollOffset = e.clientX - editorScrollContainer.getBoundingClientRect().left;
-                    editorScrollContainer.scrollLeft = newMouseXRel - scrollOffset;
-                });
-            }
-        };
-
-        node.addEventListener('wheel', handleWheel, { passive: false });
-        return { destroy() { node.removeEventListener('wheel', handleWheel); } };
-    }
-
-    // --- SAMPLER & TRIMMER STATE ---
-    let isSamplerOpen = $state(false);
-    let samplerSample: SampleRecord | null = $state(null);
-
-    // Wir trennen strikt zwischen Preview (immer bis 100% Länge) und Export (genau geschnitten)
-    let currentPreviewPath: string | null = $state(null);
-    let exportSlicedPath: string | null = $state(null);
-    let previewSliceStartPct = $state(0);
-
-    let isSlicing = $state(false);
-    let isSliceReady = $state(false);
-    let isLooping = $state(false);
-
-    let trimStartPct = $state(0);
-    let trimEndPct = $state(1);
-    let isDraggingHandle: 'start' | 'end' | null = $state(null);
-    let editorWaveformContainer: HTMLDivElement;
-
-    function openSampler(sample: SampleRecord) {
-
-        editorZoomLevel = 1.0;
-
-        if (appState.isPlaying) {
-            invoke('stop_audio').catch(console.error);
-            appState.isPlaying = false;
-            playingId = null;
-            cancelAnimationFrame(animationFrameId);
-        }
-
-        samplerSample = sample;
-        isSamplerOpen = true;
-        isSliceReady = false;
-        trimStartPct = 0;
-        trimEndPct = 1;
-        currentPreviewPath = null;
-        exportSlicedPath = null;
-    }
-
-    function closeSampler() {
-        if (appState.isPlaying) {
-            invoke('stop_audio').catch(console.error);
-            appState.isPlaying = false;
-            playingId = null;
-            cancelAnimationFrame(animationFrameId);
-        }
-
-        isSamplerOpen = false;
-        samplerSample = null;
-        currentPreviewPath = null;
-        exportSlicedPath = null;
-        isSliceReady = false;
-    }
-
-    async function confirmSlice() {
-        if (!samplerSample) return;
-        isSlicing = true;
-        try {
-            // ENTERPRISE FIX: Für den Export (Drag & Drop) schneiden wir exakt!
-            const startMs = trimStartPct * samplerSample.duration_ms;
-            const endMs = trimEndPct * samplerSample.duration_ms;
-            exportSlicedPath = await invoke<string>('slice_audio', {
-                path: samplerSample.original_path,
-                startMs: startMs,
-                endMs: endMs
-            });
-            isSliceReady = true;
-        } catch (e) {
-            console.error("Failed to slice audio:", e);
-        } finally {
-            isSlicing = false;
-        }
-    }
-
-    function editSlice() {
-        isSliceReady = false;
-        exportSlicedPath = null;
-    }
-
-    // ENTERPRISE PREVIEW: Generiert immer bis 100% Datei-Ende, um Stille beim Ziehen zu verhindern!
-    async function playSlicePreview(forceRestart = false) {
-        if (!samplerSample) return;
-
-        if (appState.isPlaying && !forceRestart) {
-            invoke('stop_audio').catch(console.error);
-            appState.isPlaying = false;
-            cancelAnimationFrame(animationFrameId);
-            return;
-        }
-
-        if (isSlicing && !currentPreviewPath) return;
-
-        // Neu berechnen, wenn noch kein File da ist, ODER der Startpunkt verschoben wurde
-        if (!isSliceReady && (!currentPreviewPath || previewSliceStartPct !== trimStartPct)) {
-            isSlicing = true;
-            try {
-                const startMs = trimStartPct * samplerSample.duration_ms;
-                const endMs = samplerSample.duration_ms; // IMMER BIS ZUM ABSOLUTEN ENDE!
-                currentPreviewPath = await invoke<string>('slice_audio', {
-                    path: samplerSample.original_path,
-                    startMs: startMs,
-                    endMs: endMs
-                });
-                previewSliceStartPct = trimStartPct;
-            } catch (e) {
-                console.error("Preview error:", e);
-                return;
-            } finally {
-                isSlicing = false;
-            }
-        }
-
-        if (currentPreviewPath) {
-            let semitones = 0;
-            if (appState.globalKey && samplerSample.key_signature) {
-                semitones = getSemitoneShift(samplerSample.key_signature, appState.globalKey, appState.globalKeyMode);
-            }
-
-            try {
-                if (appState.isPlaying) await invoke('stop_audio');
-                await invoke('play_audio', {
-                    filePath: currentPreviewPath,
-                    semitones: semitones,
-                    stretchRatio: getStretchRatio(samplerSample),
-                    volume: appState.globalVolume,
-                    speed: appState.vinylSpeedMode // <--- ÜBERGABE AN RUST
-                });
-                appState.isPlaying = true;
-                playbackStartTime = performance.now();
-                animationFrameId = requestAnimationFrame(updateProgress);
-            } catch (error) {
-                console.error(error);
-            }
-        }
-    }
-
-    function handleEditorMouseMove(e: MouseEvent) {
-        if (!isDraggingHandle || !editorWaveformContainer || isSliceReady) return;
-        const rect = editorWaveformContainer.getBoundingClientRect();
-        let pct = (e.clientX - rect.left) / rect.width;
-        pct = Math.max(0, Math.min(1, pct));
-
-        if (isDraggingHandle === 'start') {
-            trimStartPct = Math.min(pct, trimEndPct - 0.02);
-            currentPreviewPath = null; // Zerstört den Cache nur, wenn der Start verschoben wird
-        } else {
-            trimEndPct = Math.max(pct, trimStartPct + 0.02);
-            // End-Änderungen lassen das laufende Audio völlig unangetastet!
-        }
-    }
-
-    function handleEditorMouseUp() {
-        if (isDraggingHandle) {
-            const wasStart = isDraggingHandle === 'start';
-            isDraggingHandle = null;
-            // Triggert einen neuen Schnitt/Neustart NUR, wenn der linke Start-Regler angefasst wurde.
-            // Der rechte Regler ist ab sofort zu 100% dynamisch über die Engine gesteuert!
-            if (wasStart && appState.isPlaying && !isSliceReady) {
-                playSlicePreview(true);
-            }
-        }
-    }
-
-    // --- ENTERPRISE INSTANT SLICE DRAG ---
-    function nativeSliceDrag(node: HTMLElement) {
-        let startX = 0;
-        let startY = 0;
-        let isDragging = false;
-        let didDrag = false;
-
-        const handleMouseMove = async (e: MouseEvent) => {
-            // Drag ist NUR erlaubt, wenn der Nutzer auf "Confirm Selection" gedrückt hat!
-            if (isDragging || !isSliceReady || !exportSlicedPath || !samplerSample) return;
-
-            const dx = Math.abs(e.clientX - startX);
-            const dy = Math.abs(e.clientY - startY);
-
-            if (dx > 5 || dy > 5) {
-                isDragging = true;
-                cleanupWindowListeners();
-
-                try {
-                    const icon = await prepareDragIcon(samplerSample).catch(() => '');
-                    await startDrag({ item: [exportSlicedPath], icon });
-                    didDrag = true;
-                } catch (err) {
-                    console.error("Slice & Drag Error:", err);
-                } finally {
-                    isDragging = false;
-                }
-            }
-        };
-
-        const handleMouseUp = () => cleanupWindowListeners();
-        const handleClick = (e: MouseEvent) => { if (didDrag) { e.stopPropagation(); e.preventDefault(); didDrag = false; } };
-        const cleanupWindowListeners = () => {
-            window.removeEventListener('mousemove', handleMouseMove);
-            window.removeEventListener('mouseup', handleMouseUp);
-        };
-
-        const handleMouseDown = (e: MouseEvent) => {
-            if (e.button !== 0 || !isSliceReady) return;
-            e.preventDefault();
-            startX = e.clientX;
-            startY = e.clientY;
-            isDragging = false;
-            didDrag = false;
-            window.addEventListener('mousemove', handleMouseMove);
-            window.addEventListener('mouseup', handleMouseUp);
-        };
-
-        node.addEventListener('mousedown', handleMouseDown);
-        node.addEventListener('click', handleClick);
-
-        return {
-            destroy() {
-                node.removeEventListener('mousedown', handleMouseDown);
-                node.removeEventListener('click', handleClick);
-                cleanupWindowListeners();
-            }
-        };
-    }
-
-    function handleForceRetrigger() {
-        if (appState.currentSample && appState.isPlaying) {
-            if (isSamplerOpen) playSlicePreview(true); // Neustart im Editor
-            else handlePlayRequest(appState.currentSample, true); // Neustart in Liste
-        }
     }
 </script>
 
@@ -1122,100 +486,19 @@
                             <button onclick={() => { appState.activeSoundsTab = 'collections'; appState.filters.collectionId = null; appState.filters.onlyLiked = false; }} class="pb-2 text-sm font-semibold transition-colors cursor-pointer {appState.activeSoundsTab === 'collections' ? 'border-b-2 border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100' : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 border-b-2 border-transparent'}">Collections</button>
                         </div>
                     </div>
-                    <div class="flex flex-col items-end gap-3 pb-2">
-                        {#if isScanning && scanTotal > 0}
-                            <div class="w-full flex flex-col gap-1 mt-1">
-                                <div class="flex justify-between text-[10px] font-medium text-zinc-500 uppercase tracking-wider">
-                                    <span>Scanning: {scanCurrent} / {scanTotal}</span><span>{scanPercentage}%</span>
-                                </div>
-                                <div class="h-1.5 w-full rounded-full bg-zinc-200 overflow-hidden dark:bg-zinc-800">
-                                    <div class="h-full bg-blue-500 transition-all duration-300 ease-out" style="width: {scanPercentage}%"></div>
-                                </div>
-                                <div class="text-[10px] text-zinc-400 truncate text-right">{scanCurrentFile}</div>
-                            </div>
-                        {:else if scanMessage}
-                            <span class="text-xs font-medium text-zinc-500 animate-pulse">{scanMessage}</span>
-                        {/if}
-                        <div class="flex items-center gap-2">
-                            <button onclick={handleRescanAll} disabled={isScanning} class="flex h-8 items-center gap-1.5 rounded-md border border-blue-700/50 bg-blue-50 px-3 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-400 cursor-pointer disabled:opacity-50 transition-colors"><RefreshCw size={14} class={isSyncing ? "animate-spin" : ""} /> Sync</button>
-
-                            <div class="flex items-center">
-                                <button onclick={handleSelectFolder} disabled={isScanning} class="flex h-8 items-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-xs font-medium hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700 transition-colors disabled:opacity-50 cursor-pointer z-10 shadow-sm"><FolderPlus size={14} /> Add Folder</button>
-
-                                {#if scanQueue.length > 0}
-                                    <div class="relative ml-2 flex h-8 items-center shadow-sm rounded-md animate-in fade-in zoom-in-95 duration-200">
-
-                                        <button onclick={handleScan} disabled={isScanning} class="flex h-full items-center gap-1.5 rounded-l-md border border-emerald-700/50 bg-emerald-50 px-3 text-xs font-bold text-emerald-700 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400 cursor-pointer disabled:opacity-50 transition-colors">
-                                            {#if isScanningNew}
-                                                <RefreshCw size={14} class="animate-spin" /> Scanning...
-                                            {:else}
-                                                <Play size={14} /> Scan {scanQueue.length} {scanQueue.length === 1 ? 'Folder' : 'Folders'}
-                                            {/if}
-                                        </button>
-
-                                        <button onclick={(e) => { e.stopPropagation(); isQueueDropdownOpen = !isQueueDropdownOpen; }} disabled={isScanning} class="flex h-full items-center justify-center border-y border-r border-emerald-700/50 bg-emerald-50 px-1.5 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400 rounded-r-md cursor-pointer transition-colors disabled:opacity-50">
-                                            <ChevronDown size={14} />
-                                        </button>
-
-                                        {#if isQueueDropdownOpen}
-                                            <div onclick={(e) => e.stopPropagation()} class="absolute right-0 top-full mt-2 w-72 flex-col rounded-xl border border-zinc-200 bg-white p-1.5 shadow-2xl dark:border-zinc-700/60 dark:bg-[#18181b] z-50 flex">
-                                                <div class="flex items-center justify-between px-2 pb-2 pt-1 border-b border-zinc-100 dark:border-zinc-800">
-                                                    <span class="text-[10px] font-bold uppercase tracking-wider text-zinc-500">Scan Queue</span>
-                                                    <button onclick={() => { scanQueue = []; isQueueDropdownOpen = false; }} class="text-[10px] text-red-500 hover:text-red-600 uppercase font-bold tracking-wider cursor-pointer">Clear All</button>
-                                                </div>
-                                                <div class="max-h-48 overflow-y-auto no-scrollbar flex flex-col gap-0.5 mt-1.5">
-                                                    {#each scanQueue as path}
-                                                        <div class="group flex items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors">
-                                                            <div class="flex items-center gap-2 overflow-hidden">
-                                                                <Folder size={12} class="text-zinc-400 shrink-0" />
-                                                                <span class="truncate font-medium text-zinc-700 dark:text-zinc-300" title={path}>{path.split(/[/\\]/).pop()}</span>
-                                                            </div>
-                                                            <button onclick={() => { scanQueue = scanQueue.filter(p => p !== path); if(scanQueue.length === 0) isQueueDropdownOpen = false; }} class="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500 transition-all cursor-pointer shrink-0 ml-2">
-                                                                <X size={12} />
-                                                            </button>
-                                                        </div>
-                                                    {/each}
-                                                </div>
-                                            </div>
-                                        {/if}
-                                    </div>
-                                {/if}
-                            </div>
-                        </div>
-                    </div>
+                    <ScannerControls loadSamples={() => { currentPage = 1; loadSamples(); }} />
                 </div>
             </div>
 
             {#if appState.activeSoundsTab === 'collections' && appState.filters.collectionId === null && !appState.filters.onlyLiked}
                 <div class="pl-8 pr-8 pb-8 pt-4 w-full">
-                    <div class="grid grid-cols-2 gap-6 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                        <button onclick={() => { appState.filters.onlyLiked = true; currentPage = 1; loadSamples(); }} class="group flex aspect-square cursor-pointer flex-col justify-between text-left transition-all hover:-translate-y-1">
-                            <div class="flex h-full w-full flex-col items-center justify-center rounded-2xl border border-red-100 bg-gradient-to-br from-red-50 to-red-100/50 shadow-sm transition-all group-hover:shadow-md dark:border-red-900/30 dark:from-red-950/40 dark:to-red-900/10">
-                                <Heart size={48} class="fill-red-500 text-red-500 transition-transform group-hover:scale-110" />
-                                <span class="mt-4 font-bold text-red-900 dark:text-red-400">Liked Sounds</span>
-                            </div>
-                        </button>
-                        {#each appState.collections as collection}
-                            <button onclick={() => { appState.filters.collectionId = collection.id; currentPage = 1; loadSamples(); }} class="group flex aspect-square cursor-pointer flex-col justify-between rounded-2xl border border-zinc-200 bg-white p-5 text-left shadow-sm transition-all hover:-translate-y-1 hover:shadow-md dark:border-zinc-800 dark:bg-[#18181b]">
-                                <div class="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 text-zinc-600 transition-colors group-hover:bg-zinc-900 group-hover:text-white dark:bg-zinc-800 dark:text-zinc-400 dark:group-hover:bg-zinc-100 dark:group-hover:text-zinc-900"><Folder size={24} /></div>
-                                <div>
-                                    <h3 class="truncate text-lg font-bold text-zinc-900 dark:text-zinc-100" title={collection.name}>{collection.name}</h3>
-                                    <p class="mt-1 text-xs text-zinc-500">Collection</p>
-                                </div>
-                            </button>
-                        {/each}
-                        <button onclick={() => appState.isCreateCollectionModalOpen = true} class="group flex aspect-square cursor-pointer flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 p-8 text-zinc-500 transition-all hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-800 dark:bg-[#18181b]/50 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-100">
-                            <Plus size={32} class="transition-transform group-hover:scale-110" />
-                            <span class="text-sm font-bold">New Collection</span>
-                        </button>
-                    </div>
+                    <CollectionsGrid bind:currentPage {loadSamples} />
                 </div>
             {:else}
                 <div class="pb-8">
                     <div class="pl-8 pr-8 w-full">
                         <FilterMenu
                                 {activeDropdownTags}
-                                {sortedAvailableTags}
                                 {availableTags}
                                 loadSamples={() => { currentPage = 1; loadSamples(); }}
                         />
@@ -1224,28 +507,13 @@
                             <span>{#if isLoading}Loading...{:else}{totalItems} results{/if}</span>
                             <div class="flex items-center gap-3">
                                 <span class="text-xs font-medium">Sort by:</span>
-                                <div class="flex items-center rounded-md border border-zinc-200 bg-white p-0.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-                                    <div class="relative">
-                                        <button onclick={(e) => { e.stopPropagation(); isSortDropdownOpen = !isSortDropdownOpen; openDropdown = null; }} class="flex h-7 items-center gap-2 rounded px-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 transition-colors cursor-pointer">{sortField === 'name' ? 'Alphabetical' : sortField === 'type' ? 'Instrument Type' : sortField === 'pack' ? 'Sample Pack' : 'Randomize'} <ChevronDown size={14} class="opacity-50" /></button>
-                                        {#if isSortDropdownOpen}
-                                            <div onclick={(e) => e.stopPropagation()} class="absolute right-0 top-full mt-1 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                                <button onclick={() => { sortField = 'name'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'name' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Alphabetical</button>
-                                                <button onclick={() => { sortField = 'type'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'type' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Instrument Type</button>
-                                                <button onclick={() => { sortField = 'pack'; isSortDropdownOpen = false; currentPage = 1; loadSamples(); }} class="w-full text-left rounded-md px-2 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer {sortField === 'pack' ? 'font-bold text-zinc-900 dark:text-white' : ''}">Sample Pack</button>
-                                            </div>
-                                        {/if}
-                                    </div>
-                                    <div class="h-4 w-px bg-zinc-200 dark:bg-zinc-700 mx-0.5"></div>
-                                    <button onclick={() => { sortOrder = sortOrder === 'asc' ? 'desc' : 'asc'; if(sortField !== 'random') { currentPage = 1; loadSamples(); } }} disabled={sortField === 'random'} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer" title="Reverse Order"><ArrowDownUp size={14} class={sortOrder === 'desc' ? 'rotate-180 transition-transform' : 'transition-transform'} /></button>
-                                    <button onclick={() => { sortField = 'random'; currentPage = 1; loadSamples(); }} class="flex h-7 w-7 items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 transition-colors cursor-pointer {sortField === 'random' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100 shadow-inner' : ''}" title="Shuffle"><Shuffle size={14} /></button>
-                                </div>
+                                <SortMenu bind:sortField bind:sortOrder loadSamples={() => { currentPage = 1; loadSamples(); }} />
                             </div>
                         </div>
                     </div>
 
                     <div class="w-full overflow-x-auto pb-4 no-scrollbar">
                         <div class="min-w-[760px] pl-8 pr-8">
-
                             <div class="grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] gap-4 border-y border-zinc-200 py-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:border-zinc-800 items-center -mx-2 px-2">
                                 <div></div><div></div><div></div>
                                 <div>Filename</div><div>Waveform</div><div class="text-right">Time</div><div class="text-center">Key</div><div class="text-center">BPM</div>
@@ -1260,128 +528,30 @@
                                 {#if isLoading && samples.length === 0}
                                     <div class="flex justify-center items-center h-40 text-sm text-zinc-500 animate-pulse">Loading library...</div>
                                 {:else if samples.length === 0}
-                                    {#if hasActiveFilters}
-                                        <div class="flex flex-col items-center justify-center py-32 text-zinc-500">
-                                            <Search size={48} class="mb-4 opacity-20" />
-                                            <span class="text-sm font-medium">No samples found matching these filters.</span>
-                                            <button onclick={clearAllFilters} class="mt-4 text-xs font-semibold text-zinc-900 dark:text-zinc-100 underline cursor-pointer hover:opacity-70 transition-opacity">Clear all filters</button>
-                                        </div>
-                                    {:else}
-                                        <div class="w-full px-0 pb-0 mt-8">
-                                            <div class="flex w-full flex-col items-center justify-center py-24 text-zinc-500 border-2 border-dashed border-zinc-200 dark:border-zinc-800/60 rounded-2xl bg-zinc-50/50 dark:bg-[#121212]/50 transition-all">
-                                                <div class="h-16 w-16 bg-zinc-100 dark:bg-zinc-800 rounded-2xl flex items-center justify-center mb-6 shadow-sm border border-zinc-200 dark:border-zinc-700">
-                                                    <Library size={28} class="text-zinc-400" />
-                                                </div>
-                                                <h2 class="text-xl font-bold text-zinc-900 dark:text-white mb-2">Your library is empty</h2>
-                                                <p class="text-sm text-zinc-500 mb-8 max-w-md text-center leading-relaxed">To view and manage your sounds, connect the folder where you store your music production files.</p>
-
-                                                <div class="flex items-center gap-3">
-                                                    <button onclick={handleSelectFolder} disabled={isScanning} class="flex items-center gap-2 rounded-lg bg-zinc-900 px-6 py-3 text-sm font-bold text-white shadow-sm hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 transition-colors disabled:opacity-50 cursor-pointer">
-                                                        <FolderPlus size={18} /> Select Folders
-                                                    </button>
-
-                                                    {#if scanQueue.length > 0}
-                                                        <button onclick={handleScan} disabled={isScanning} class="flex items-center gap-2 rounded-lg bg-emerald-500 px-6 py-3 text-sm font-bold text-white shadow-sm hover:bg-emerald-600 transition-colors disabled:opacity-50 cursor-pointer animate-in fade-in slide-in-from-left-4 duration-300">
-                                                            {#if isScanningNew}
-                                                                <RefreshCw size={18} class="animate-spin" /> Scanning...
-                                                            {:else}
-                                                                <Play size={18} /> Scan {scanQueue.length} {scanQueue.length === 1 ? 'Folder' : 'Folders'}
-                                                            {/if}
-                                                        </button>
-                                                    {/if}
-                                                </div>
-
-                                                {#if scanMessage && isScanningNew}
-                                                    <p class="mt-4 text-xs font-semibold text-emerald-600 dark:text-emerald-400 animate-pulse">{scanMessage}</p>
-                                                {/if}
-
-                                                {#if scanQueue.length > 0}
-                                                    <div class="mt-10 w-full max-w-lg border-t border-zinc-200 dark:border-zinc-800/60 pt-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
-                                                        <h3 class="text-[10px] font-bold uppercase tracking-wider text-zinc-400 mb-3 flex items-center justify-between px-1">
-                                                            <span>Warteschlange ({scanQueue.length})</span>
-                                                            <button onclick={() => scanQueue = []} class="hover:text-red-500 transition-colors cursor-pointer">Clear All</button>
-                                                        </h3>
-                                                        <div class="flex flex-col gap-2 max-h-48 overflow-y-auto no-scrollbar">
-                                                            {#each scanQueue as path}
-                                                                <div class="flex items-center justify-between bg-white dark:bg-[#18181b] border border-zinc-200 dark:border-zinc-800/80 rounded-lg px-3 py-2.5 shadow-sm">
-                                                                    <div class="flex items-center gap-3 overflow-hidden">
-                                                                        <Folder size={14} class="text-zinc-400 shrink-0" />
-                                                                        <span class="text-xs font-bold text-zinc-700 dark:text-zinc-300 truncate" title={path}>{path.split(/[/\\]/).pop()}</span>
-                                                                    </div>
-                                                                    <button onclick={() => scanQueue = scanQueue.filter(p => p !== path)} class="text-zinc-400 hover:text-red-500 shrink-0 ml-2 transition-colors cursor-pointer">
-                                                                        <X size={14} />
-                                                                    </button>
-                                                                </div>
-                                                            {/each}
-                                                        </div>
-                                                    </div>
-                                                {/if}
-                                            </div>
-                                        </div>
-                                    {/if}
+                                    <EmptyLibrary
+                                            {hasActiveFilters}
+                                            clearAllFilters={() => {
+                                                appState.filters.instruments = []; appState.filters.genres = []; appState.filters.formats = []; appState.filters.keys = [];
+                                                appState.filters.bpm.exact = null; appState.filters.bpm.min = null; appState.filters.bpm.max = null;
+                                                appState.filters.tagMatchMode = 'AND';
+                                                currentPage = 1; loadSamples();
+                                            }}
+                                            loadSamples={() => { currentPage = 1; loadSamples(); }}
+                                    />
                                 {:else}
                                     <div class="divide-y divide-zinc-100 dark:divide-zinc-800/50 mb-8 transition-opacity duration-200 {isLoading ? 'opacity-40 pointer-events-none' : 'opacity-100'}">
                                         {#each samples as sample}
-                                            <div id="sample-{sample.id}" class="group grid grid-cols-[20px_40px_32px_minmax(150px,2fr)_minmax(120px,1.5fr)_50px_40px_40px_32px_32px] items-center gap-4 py-2 rounded-md -mx-2 px-2 {selectedId === sample.id ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/20'}">
-                                                <div class="flex justify-center"><input type="checkbox" checked={appState.selectedSampleIds.includes(sample.id)} onchange={(e) => toggleSampleSelection(sample.id, e.currentTarget.checked)} class="h-4 w-4 rounded border-zinc-300 bg-zinc-100 cursor-pointer accent-zinc-900 dark:accent-zinc-100"></div>
-                                                <div
-                                                        use:nativeDrag={sample}
-                                                        class="h-10 w-10 flex items-center justify-center rounded-md bg-zinc-200/50 text-zinc-400 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/50 overflow-hidden shrink-0 cursor-grab active:cursor-grabbing"
-                                                >
-                                                    {#if sample.cover_path}
-                                                        <img
-                                                                src={convertFileSrc(sample.cover_path)}
-                                                                alt="Cover"
-                                                                class="h-full w-full object-cover pointer-events-none"
-                                                                loading="lazy"
-                                                        />
-                                                    {:else}
-                                                        <ImageIcon size={20} class="pointer-events-none" />
-                                                    {/if}
-                                                </div>
-                                                <div class="flex justify-center"><button onclick={() => handlePlayRequest(sample)} class="flex h-8 w-8 items-center justify-center rounded-full bg-zinc-900 text-zinc-100 hover:scale-105 dark:bg-zinc-100 dark:text-zinc-900 transition-transform cursor-pointer shadow-sm">{#if playingId === sample.id} <Pause size={14} /> {:else} <Play size={14} class="ml-0.5" /> {/if}</button></div>
-
-                                                <div class="flex flex-col min-w-0 pr-4 cursor-pointer" role="button" tabindex="0" onclick={() => { selectedId = sample.id; }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') selectedId = sample.id; }}>
-                                                    <span
-                                                            use:nativeDrag={sample}
-                                                            class="truncate text-sm font-semibold hover:underline cursor-grab active:cursor-grabbing select-none"
-                                                            title={sample.original_path}
-                                                    >
-                                                        {sample.filename}
-                                                    </span>
-                                                    <div class="flex flex-wrap gap-1.5 mt-1 h-4 overflow-hidden">
-                                                        {#each parseTags(sample.tags) as tag}
-                                                            <span class="rounded px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider {tag.category === 'Format' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : tag.category === 'Drums' || tag.category === 'Percussion' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : tag.category === 'Genre' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-zinc-200/60 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400'}">{tag.value}</span>
-                                                        {/each}
-                                                        {#if parseTags(sample.tags).length === 0} <span class="rounded bg-zinc-200/60 px-1.5 py-[1px] text-[9px] font-bold uppercase tracking-wider text-zinc-400 dark:bg-zinc-800">AUDIO</span> {/if}
-                                                    </div>
-                                                </div>
-
-                                                <div
-                                                        use:nativeDrag={sample}
-                                                        class="flex items-center gap-[2px] h-8 overflow-hidden opacity-60 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing"
-                                                >
-                                                    {#each parseWaveform(sample.waveform_data) as barHeight, i}
-                                                        <div class="w-[3px] rounded-full pointer-events-none {playingId === sample.id && (i / 40) <= appState.playbackProgress ? 'bg-emerald-500' : 'bg-zinc-300 dark:bg-zinc-700'}" style="height: {barHeight}%;"></div>
-                                                    {/each}
-                                                </div>
-                                                <div class="text-right text-xs font-medium text-zinc-500 tabular-nums">{formatDuration(sample.duration_ms)}</div>
-                                                <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.key_signature || "--"}</div>
-                                                <div class="text-center text-xs font-semibold text-zinc-700 dark:text-zinc-300">{sample.bpm ? Math.round(sample.bpm) : "--"}</div>
-                                                <div class="flex justify-center"><button onclick={(e) => toggleLike(sample, e)} class="transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || sample.is_liked ? 'opacity-100' : 'opacity-0'} {sample.is_liked ? 'text-red-500 hover:text-red-600' : 'text-zinc-400 hover:text-red-500'}"><Heart size={16} class={sample.is_liked ? 'fill-red-500' : ''} /></button></div>
-                                                <div class="relative flex justify-center">
-                                                    <button onclick={(e) => { e.stopPropagation(); openContextMenuId = openContextMenuId === sample.id ? null : sample.id; }} class="text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer group-hover:opacity-100 {selectedId === sample.id || openContextMenuId === sample.id ? 'opacity-100' : 'opacity-0'}"><EllipsisVertical size={16} /></button>
-                                                    {#if openContextMenuId === sample.id}
-                                                        <div onclick={(e) => e.stopPropagation()} class="absolute right-full top-0 mr-2 w-40 flex-col rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-800 dark:bg-[#18181b] z-50">
-                                                            <button onclick={() => { openSampler(sample); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/30 cursor-pointer transition-colors">Open in Sampler</button>
-                                                            <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
-                                                            <button onclick={() => openEditModal(sample)} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Edit Metadata</button>
-                                                            <div class="my-0.5 border-t border-zinc-200 dark:border-zinc-800/50"></div>
-                                                            <button onclick={() => { invoke('reveal_in_finder', { path: sample.original_path }); openContextMenuId = null; }} class="w-full text-left rounded-md px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer transition-colors">Reveal in Finder</button>
-                                                        </div>
-                                                    {/if}
-                                                </div>
-                                            </div>
+                                            <SampleRow
+                                                    {sample}
+                                                    {selectedId}
+                                                    {playingId}
+                                                    bind:openContextMenuId
+                                                    {handlePlayRequest}
+                                                    {toggleLike}
+                                                    {openEditModal}
+                                                    openSampler={() => openSampler(sample)}
+                                                    {toggleSampleSelection}
+                                            />
                                         {/each}
                                     </div>
                                 {/if}
@@ -1390,20 +560,16 @@
                     </div>
 
                     <Pagination bind:currentPage {totalPages} {loadSamples} />
-
                 </div>
             {/if}
         </div>
 
         <BulkSidebar bind:samples {allAvailableTags} {loadAllTags} />
-
     </div>
 {:else if appState.currentView === 'projects'}
     <div class="flex h-full items-center justify-center text-zinc-500"><h2 class="text-2xl font-bold">Musik Projekte (Coming Soon)</h2></div>
 {:else if appState.currentView === 'editor'}
-    <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8">
-    </div>
-
+    <div class="flex h-full w-full flex-col overflow-y-auto px-10 py-8"></div>
 {:else if appState.currentView === 'settings'}
     <SettingsView bind:samples {allAvailableTags} {loadAllTags} />
 {/if}
@@ -1412,146 +578,6 @@
     <MetadataEditor bind:editingSample bind:samples {allAvailableTags} {loadAllTags} />
 {/if}
 
-{#if isSamplerOpen && samplerSample}
-    <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200 p-8">
-        <div class="w-full max-w-5xl bg-white dark:bg-[#18181b] border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
-
-            <div class="flex items-center justify-between px-6 py-4 border-b border-zinc-100 dark:border-zinc-800/50 bg-zinc-50/50 dark:bg-zinc-900/50">
-                <div class="flex items-center gap-4">
-                    <div class="h-12 w-12 flex items-center justify-center rounded-md bg-zinc-200 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 overflow-hidden shrink-0 shadow-sm">
-                        {#if samplerSample.cover_path}
-                            <img src={convertFileSrc(samplerSample.cover_path)} alt="Cover" class="h-full w-full object-cover" />
-                        {:else}
-                            <ImageIcon size={20} class="text-zinc-400" />
-                        {/if}
-                    </div>
-                    <div>
-                        <h2 class="text-lg font-bold text-zinc-900 dark:text-white leading-none">{samplerSample.filename}</h2>
-                        <div class="flex items-center gap-2 mt-2 text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">
-                            <span class="bg-zinc-200/60 dark:bg-zinc-800 px-1.5 py-[2px] rounded text-zinc-700 dark:text-zinc-300">{samplerSample.extension}</span>
-                            <span>{formatDuration(samplerSample.duration_ms)}</span>
-                            {#if samplerSample.bpm}<span>• {Math.round(samplerSample.bpm)} BPM</span>{/if}
-                            {#if samplerSample.key_signature}<span>• {samplerSample.key_signature}</span>{/if}
-                        </div>
-                    </div>
-                </div>
-                <button onclick={closeSampler} class="h-8 w-8 flex items-center justify-center rounded-full text-zinc-400 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-white transition-colors cursor-pointer">
-                    <X size={20} />
-                </button>
-            </div>
-
-            <div class="p-6 pb-8">
-                <div class="flex justify-between mb-3 text-[11px] font-bold uppercase tracking-wider text-zinc-400 tabular-nums px-1">
-                    <span>Start: {formatDuration(samplerSample.duration_ms * trimStartPct)}</span>
-                    <span class="text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-800/50">
-                        Selection Length: {formatDuration(samplerSample.duration_ms * (trimEndPct - trimStartPct))}
-                    </span>
-                    <span>End: {formatDuration(samplerSample.duration_ms * trimEndPct)}</span>
-                </div>
-
-                <div
-                        bind:this={editorScrollContainer}
-                        use:editorWheelZoom
-                        class="w-full h-48 bg-zinc-100 dark:bg-[#121214] border border-zinc-200 dark:border-zinc-800 rounded-xl {editorZoomLevel > 1.0 ? 'overflow-x-auto' : 'overflow-hidden'} overflow-y-hidden shadow-inner relative no-scrollbar"
-                >
-                    <div
-                            bind:this={editorWaveformContainer}
-                            class="relative h-full select-none origin-left"
-                            style="width: {editorZoomLevel * 100}%"
-                    >
-                        {#if !isSliceReady}
-                            <div class="absolute inset-0 z-20 cursor-crosshair" onmousedown={handleWaveformClick} role="button" tabindex="0"></div>
-                        {/if}
-
-                        <div class="absolute inset-0 flex items-center justify-between gap-[1px] opacity-20 pointer-events-none">
-                            {#each parseWaveform(samplerSample.waveform_data, Math.floor(300 * editorZoomLevel)) as barHeight}
-                                <div class="w-full rounded-full bg-zinc-500" style="height: {barHeight}%;"></div>
-                            {/each}
-                        </div>
-
-                        <div
-                                class="absolute inset-0 flex items-center justify-between gap-[1px] pointer-events-none"
-                                style="clip-path: polygon({trimStartPct * 100}% 0, {trimEndPct * 100}% 0, {trimEndPct * 100}% 100%, {trimStartPct * 100}% 100%);"
-                        >
-                            {#each parseWaveform(samplerSample.waveform_data, Math.floor(300 * editorZoomLevel)) as barHeight}
-                                <div class="w-full rounded-full {isSliceReady ? 'bg-emerald-400' : 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]'} transition-colors" style="height: {barHeight}%;"></div>
-                            {/each}
-                        </div>
-
-                        <div
-                                class="absolute top-0 bottom-0 {isSliceReady ? 'bg-emerald-500/10' : 'bg-transparent'} transition-colors duration-300 pointer-events-none"
-                                style="left: {trimStartPct * 100}%; right: {(1 - trimEndPct) * 100}%"
-                        >
-                            <div class="absolute -top-3 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity mt-6 z-30 pointer-events-none">
-                                <div class="bg-zinc-900 dark:bg-black text-white text-[10px] font-bold px-3 py-1.5 rounded-full shadow-xl flex items-center gap-1.5 border border-zinc-700/50">
-                                    {#if isSlicing}
-                                        <RefreshCw size={12} class="animate-spin text-emerald-400" /> <span>Slicing...</span>
-                                    {:else}
-                                        <Download size={12} class="text-emerald-400" /> <span>Drag to DAW</span>
-                                    {/if}
-                                </div>
-                            </div>
-
-                            {#if appState.isPlaying && isSamplerOpen}
-                                <div class="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_10px_rgba(255,255,255,1)] z-50 pointer-events-none" style="left: {appState.playbackProgress * 100}%"></div>
-                            {/if}
-
-                            {#if isSliceReady}
-                                <div
-                                        use:nativeSliceDrag
-                                        class="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-emerald-900/40 cursor-grab active:cursor-grabbing backdrop-blur-sm z-30 pointer-events-auto"
-                                >
-                                    <span class="text-white font-bold tracking-wider uppercase text-sm px-4 py-2 bg-black/80 shadow-xl rounded-md flex items-center gap-2"><Download size={16} /> Drag to DAW</span>
-                                </div>
-                            {:else}
-                                <div class="absolute left-0 top-0 bottom-0 w-6 cursor-ew-resize flex flex-col items-start group/handle z-40 pointer-events-auto" onmousedown={(e) => { isDraggingHandle = 'start'; e.stopPropagation(); }}>
-                                    <div class="bg-emerald-600 group-hover/handle:bg-emerald-400 text-white text-[9px] font-black px-1.5 py-0.5 rounded-br-md shadow-md transition-colors">S</div>
-                                    <div class="w-[2px] h-full bg-emerald-600/80 group-hover/handle:bg-emerald-400 shadow-sm transition-colors -mt-[1px]"></div>
-                                </div>
-
-                                <div class="absolute right-0 top-0 bottom-0 w-6 cursor-ew-resize flex flex-col items-end group/handle z-40 pointer-events-auto" onmousedown={(e) => { isDraggingHandle = 'end'; e.stopPropagation(); }}>
-                                    <div class="bg-emerald-600 group-hover/handle:bg-emerald-400 text-white text-[9px] font-black px-1.5 py-0.5 rounded-bl-md shadow-md transition-colors">E</div>
-                                    <div class="w-[2px] h-full bg-emerald-600/80 group-hover/handle:bg-emerald-400 shadow-sm transition-colors -mt-[1px]"></div>
-                                </div>
-                            {/if}
-                        </div>
-                    </div>
-                </div>
-
-                <div class="mt-5 flex items-center justify-between">
-                    <div class="flex items-center gap-4">
-                        <button onclick={() => isLooping = !isLooping} class="flex items-center gap-2 px-3 py-2 rounded-md text-[11px] font-bold uppercase tracking-wider transition-colors {isLooping ? 'bg-emerald-500 text-white shadow-sm' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800/50 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-white'} cursor-pointer">
-                            <Repeat size={14} /> Loop
-                        </button>
-
-                        <div class="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800/60 bg-white dark:bg-[#18181b] shadow-sm">
-                            <button onclick={handleZoomOut} disabled={editorZoomLevel <= 1.0} class="flex items-center justify-center h-8 w-8 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 disabled:opacity-30 transition-colors rounded-l-md cursor-pointer"><ZoomOut size={14} /></button>
-                            <div class="w-px h-4 bg-zinc-200 dark:bg-zinc-800"></div>
-                            <span class="text-[10px] font-bold text-zinc-500 w-12 text-center tabular-nums cursor-default select-none" title="Cmd/Ctrl + Mousewheel to zoom">
-                                {Math.round(editorZoomLevel * 100)}%
-                            </span>
-                            <div class="w-px h-4 bg-zinc-200 dark:bg-zinc-800"></div>
-                            <button onclick={handleZoomIn} disabled={editorZoomLevel >= 20.0} class="flex items-center justify-center h-8 w-8 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 disabled:opacity-30 transition-colors rounded-r-md cursor-pointer"><ZoomIn size={14} /></button>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center gap-3">
-                        <button onclick={playSlicePreview} class="flex items-center gap-2 px-4 py-2 rounded-md text-xs font-bold uppercase tracking-wider transition-colors {appState.isPlaying ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-800 dark:text-white' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800/50 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-white'} cursor-pointer">
-                            {#if appState.isPlaying} <Pause size={14}/> Stop {:else} <Play size={14}/> Preview (Space) {/if}
-                        </button>
-
-                        {#if !isSliceReady}
-                            <button onclick={confirmSlice} disabled={isSlicing} class="flex items-center gap-2 px-5 py-2 rounded-md text-xs font-bold uppercase tracking-wider bg-emerald-500 text-white hover:bg-emerald-600 transition-colors shadow-sm disabled:opacity-50 cursor-pointer">
-                                {#if isSlicing} <RefreshCw size={14} class="animate-spin"/> Rendering... {:else} Confirm Selection {/if}
-                            </button>
-                        {:else}
-                            <button onclick={editSlice} class="flex items-center gap-2 px-5 py-2 rounded-md text-xs font-bold uppercase tracking-wider bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 transition-colors shadow-sm cursor-pointer">
-                                Edit Selection
-                            </button>
-                        {/if}
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
+{#if editorState.isOpen}
+    <SamplerModal {playSlicePreview} />
 {/if}
