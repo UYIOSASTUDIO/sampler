@@ -1,7 +1,7 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
-use std::str::FromStr;
 use std::path::Path;
+use std::str::FromStr;
 
 pub async fn init_db(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_url = format!("sqlite://{}", db_path.to_string_lossy());
@@ -25,9 +25,7 @@ pub async fn init_db(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     // Das Makro bindet den migrations-Ordner zur Compile-Zeit in die Binary ein.
     // Beim App-Start wird geprüft, welche SQL-Dateien bereits angewendet wurden.
     // Fehlende Updates werden transaktionssicher nachgezogen.
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     Ok(pool)
 }

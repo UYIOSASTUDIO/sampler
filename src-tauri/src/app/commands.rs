@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite};
 use tauri::State;
 
-use rodio::{Sink, buffer::SamplesBuffer};
-use std::sync::{Arc, Mutex};
+use rodio::{buffer::SamplesBuffer, Sink};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Symphonia — universeller Decoder für WAV, MP3, FLAC, AIFF, OGG, M4A
 use symphonia::core::audio::SampleBuffer as SymphoniaSampleBuffer;
@@ -113,10 +113,11 @@ pub async fn rescan_all_folders(
 pub async fn get_connected_folders(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let pool = &state.db;
 
-    let folders: Vec<(String,)> = sqlx::query_as("SELECT path FROM connected_folders ORDER BY added_at DESC")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let folders: Vec<(String,)> =
+        sqlx::query_as("SELECT path FROM connected_folders ORDER BY added_at DESC")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     Ok(folders.into_iter().map(|(path,)| path).collect())
 }
@@ -134,9 +135,13 @@ fn build_where_clause<'args>(
 
     macro_rules! push_and {
         () => {
-            if has_where { builder.push(" AND "); }
-            else { builder.push(" WHERE "); has_where = true; }
-        }
+            if has_where {
+                builder.push(" AND ");
+            } else {
+                builder.push(" WHERE ");
+                has_where = true;
+            }
+        };
     }
 
     // NEU: Favoriten-Filter zwingend anwenden, wenn aktiv
@@ -151,7 +156,9 @@ fn build_where_clause<'args>(
         builder.push_bind(s);
     }
 
-    let all_tags: Vec<&String> = filters.instruments.iter()
+    let all_tags: Vec<&String> = filters
+        .instruments
+        .iter()
         .chain(filters.genres.iter())
         .chain(filters.formats.iter())
         .collect();
@@ -159,10 +166,14 @@ fn build_where_clause<'args>(
     if !all_tags.is_empty() {
         if filters.tag_match_mode == "OR" {
             push_and!();
-            builder.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_extract(value, '$.value') IN (");
+            builder.push(
+                "EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_extract(value, '$.value') IN (",
+            );
             let mut sep = builder.separated(", ");
             // DER FIX: &t entpackt die Referenz, wodurch sie wieder lang genug lebt!
-            for &t in &all_tags { sep.push_bind(t); }
+            for &t in &all_tags {
+                sep.push_bind(t);
+            }
             builder.push("))");
         } else {
             for &t in &all_tags {
@@ -180,7 +191,9 @@ fn build_where_clause<'args>(
         builder.push("(");
         let mut first = true;
         for v in &filters.keys {
-            if !first { builder.push(" OR "); }
+            if !first {
+                builder.push(" OR ");
+            }
             first = false;
 
             if v == "min" || v == "maj" {
@@ -197,10 +210,20 @@ fn build_where_clause<'args>(
     }
 
     if filters.bpm.is_range {
-        if let Some(min) = filters.bpm.min { push_and!(); builder.push("s.bpm >= "); builder.push_bind(min); }
-        if let Some(max) = filters.bpm.max { push_and!(); builder.push("s.bpm <= "); builder.push_bind(max); }
+        if let Some(min) = filters.bpm.min {
+            push_and!();
+            builder.push("s.bpm >= ");
+            builder.push_bind(min);
+        }
+        if let Some(max) = filters.bpm.max {
+            push_and!();
+            builder.push("s.bpm <= ");
+            builder.push_bind(max);
+        }
     } else if let Some(exact) = filters.bpm.exact {
-        push_and!(); builder.push("s.bpm = "); builder.push_bind(exact);
+        push_and!();
+        builder.push("s.bpm = ");
+        builder.push_bind(exact);
     }
 }
 
@@ -213,7 +236,7 @@ pub async fn get_samples(
     filters: FilterPayload,
     sort_field: String, // NEU: name, type, pack oder random
     sort_order: String, // NEU: asc oder desc
-    state: State<'_, AppState>
+    state: State<'_, AppState>,
 ) -> Result<PaginatedResponse, String> {
     let pool = &state.db;
 
@@ -221,35 +244,45 @@ pub async fn get_samples(
     let offset = ((page.max(1) - 1) * page_size) as i64;
 
     // Wir bereiten die Suche so vor, dass sie nur Dateinamen und Tags scannt
-    let fts_match = search_query
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let sanitized = s.replace("\"", "");
-            format!("filename:\"{sanitized}\"* OR tags:\"{sanitized}\"*")
-        });
+    let fts_match = search_query.filter(|s| !s.trim().is_empty()).map(|s| {
+        let sanitized = s.replace("\"", "");
+        format!("filename:\"{sanitized}\"* OR tags:\"{sanitized}\"*")
+    });
 
     // 1. TOTAL COUNT
     let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM samples s ");
-    if fts_match.is_some() { count_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
+    if fts_match.is_some() {
+        count_query.push("INNER JOIN samples_fts fts ON s.id = fts.id ");
+    }
 
     // DER FIX: Der Collection-Join MUSS auch hier beim Zählen rein!
     if let Some(c_id) = filters.collection_id {
-        count_query.push("INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ");
+        count_query.push(
+            "INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ",
+        );
         count_query.push_bind(c_id);
         count_query.push(" ");
     }
 
     build_where_clause(&mut count_query, &filters, &fts_match);
-    let total_count: i64 = count_query.build_query_scalar().fetch_one(pool).await.unwrap_or(0);
+    let total_count: i64 = count_query
+        .build_query_scalar()
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
 
     // 2. DYNAMISCHE SAMPLES
     let mut samples_query = QueryBuilder::new("SELECT s.id, s.filename, s.original_path, s.duration_ms, s.bpm, s.key_signature, s.instrument_type, s.tags, s.waveform_data, s.is_liked, s.cover_path FROM samples s ");
 
-    if fts_match.is_some() { samples_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
+    if fts_match.is_some() {
+        samples_query.push("INNER JOIN samples_fts fts ON s.id = fts.id ");
+    }
 
     // NEU: Wenn eine Collection gefiltert wird, joine die relationale Tabelle
     if let Some(c_id) = filters.collection_id {
-        samples_query.push("INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ");
+        samples_query.push(
+            "INNER JOIN collection_samples cs ON s.id = cs.sample_id AND cs.collection_id = ",
+        );
         samples_query.push_bind(c_id);
         samples_query.push(" ");
     }
@@ -258,11 +291,21 @@ pub async fn get_samples(
 
     // NEU: Dynamische ORDER BY Klausel
     match sort_field.as_str() {
-        "name" => { samples_query.push(" ORDER BY s.filename "); }
-        "type" => { samples_query.push(" ORDER BY s.instrument_type "); }
-        "pack" => { samples_query.push(" ORDER BY s.original_path "); }
-        "random" => { samples_query.push(" ORDER BY RANDOM() "); }
-        _ => { samples_query.push(" ORDER BY s.filename "); }
+        "name" => {
+            samples_query.push(" ORDER BY s.filename ");
+        }
+        "type" => {
+            samples_query.push(" ORDER BY s.instrument_type ");
+        }
+        "pack" => {
+            samples_query.push(" ORDER BY s.original_path ");
+        }
+        "random" => {
+            samples_query.push(" ORDER BY RANDOM() ");
+        }
+        _ => {
+            samples_query.push(" ORDER BY s.filename ");
+        }
     }
 
     // Random hat kein ASC/DESC, alles andere schon
@@ -280,30 +323,59 @@ pub async fn get_samples(
     samples_query.push(" OFFSET ");
     samples_query.push_bind(offset);
 
-    let samples = samples_query.build_query_as::<SampleRecord>().fetch_all(pool).await.map_err(|e| e.to_string())?;
+    let samples = samples_query
+        .build_query_as::<SampleRecord>()
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // 3. DYNAMISCHE FACETTEN-SUCHE
     let mut tags_query = QueryBuilder::new("SELECT DISTINCT json_extract(value, '$.category') as category, json_extract(value, '$.value') as value FROM samples s ");
-    if fts_match.is_some() { tags_query.push("INNER JOIN samples_fts fts ON s.id = fts.id "); }
+    if fts_match.is_some() {
+        tags_query.push("INNER JOIN samples_fts fts ON s.id = fts.id ");
+    }
     tags_query.push(", json_each(s.tags) ");
     build_where_clause(&mut tags_query, &filters, &fts_match);
 
-    let mut tags_vec = tags_query.build_query_as::<TagResponse>().fetch_all(pool).await.unwrap_or_default();
+    let mut tags_vec = tags_query
+        .build_query_as::<TagResponse>()
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
 
     tags_vec.sort_by(|a, b| {
         let prio = |cat: &str, val: &str| -> i32 {
-            if cat == val { return 1; }
+            if cat == val {
+                return 1;
+            }
             match cat {
-                "Drums" | "Percussion" | "Bass" | "Synth" | "Keys" | "Guitar" | "Strings" | "Vocals" | "Brass and Woodwinds" | "FX" => 2,
-                "Format" => 3, "Genre" => 4, "Character" => 5, _ => 6,
+                "Drums"
+                | "Percussion"
+                | "Bass"
+                | "Synth"
+                | "Keys"
+                | "Guitar"
+                | "Strings"
+                | "Vocals"
+                | "Brass and Woodwinds"
+                | "FX" => 2,
+                "Format" => 3,
+                "Genre" => 4,
+                "Character" => 5,
+                _ => 6,
             }
         };
-        prio(&a.category, &a.value).cmp(&prio(&b.category, &b.value))
+        prio(&a.category, &a.value)
+            .cmp(&prio(&b.category, &b.value))
             .then_with(|| a.category.cmp(&b.category))
             .then_with(|| a.value.cmp(&b.value))
     });
 
-    Ok(PaginatedResponse { samples, total_count, available_tags: tags_vec })
+    Ok(PaginatedResponse {
+        samples,
+        total_count,
+        available_tags: tags_vec,
+    })
 }
 
 // 4. CLEAR: Löscht die gesamte Library
@@ -312,9 +384,18 @@ pub async fn clear_database(state: State<'_, AppState>) -> Result<(), String> {
     let pool = &state.db;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-    sqlx::query("DELETE FROM samples").execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("DELETE FROM samples_fts").execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("DELETE FROM connected_folders").execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM samples")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM samples_fts")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM connected_folders")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
@@ -352,7 +433,9 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
     let mut removed = 0;
 
     let folders: Vec<(String,)> = sqlx::query_as("SELECT path FROM connected_folders")
-        .fetch_all(pool).await.map_err(|e| e.to_string())?;
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut online_folders = Vec::new();
     for (folder,) in folders {
@@ -371,9 +454,8 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
     // führen danach einen einzigen atomaren Batch-Delete durch.
     use futures::StreamExt;
 
-    let mut stream = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, original_path FROM samples"
-    ).fetch(pool);
+    let mut stream =
+        sqlx::query_as::<_, (String, String)>("SELECT id, original_path FROM samples").fetch(pool);
 
     let mut ids_to_delete: Vec<String> = Vec::new();
 
@@ -392,7 +474,9 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
         for id in &ids_to_delete {
             let _ = sqlx::query("DELETE FROM samples WHERE id = ?")
-                .bind(id).execute(&mut *tx).await;
+                .bind(id)
+                .execute(&mut *tx)
+                .await;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
         removed = ids_to_delete.len();
@@ -405,15 +489,24 @@ pub async fn cleanup_database(state: State<'_, AppState>) -> Result<usize, Strin
 #[tauri::command]
 pub fn reveal_in_finder(path: String) {
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&path)
+        .spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(format!("/select,\"{}\"", path)).spawn();
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,\"{}\"", path))
+        .spawn();
 }
 
 // 9. TOGGLE LIKE: Ändert den Favoriten-Status in der Datenbank
 #[tauri::command]
-pub async fn toggle_sample_like(id: String, is_liked: bool, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn toggle_sample_like(
+    id: String,
+    is_liked: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let pool = &state.db;
 
     sqlx::query("UPDATE samples SET is_liked = ? WHERE id = ?")
@@ -445,29 +538,51 @@ pub async fn get_collections(state: State<'_, AppState>) -> Result<Vec<Collectio
 #[tauri::command]
 pub async fn create_collection(name: String, state: State<'_, AppState>) -> Result<i64, String> {
     let result = sqlx::query("INSERT INTO collections (name) VALUES (?)")
-        .bind(name).execute(&state.db).await.map_err(|e| e.to_string())?;
+        .bind(name)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(result.last_insert_rowid())
 }
 
 #[tauri::command]
-pub async fn add_to_collection(collection_id: i64, sample_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    let mut builder = QueryBuilder::new("INSERT OR IGNORE INTO collection_samples (collection_id, sample_id) ");
+pub async fn add_to_collection(
+    collection_id: i64,
+    sample_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut builder =
+        QueryBuilder::new("INSERT OR IGNORE INTO collection_samples (collection_id, sample_id) ");
     builder.push_values(sample_ids, |mut b, id| {
         b.push_bind(collection_id).push_bind(id);
     });
-    builder.build().execute(&state.db).await.map_err(|e| e.to_string())?;
+    builder
+        .build()
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn bulk_toggle_like(sample_ids: Vec<String>, is_liked: bool, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn bulk_toggle_like(
+    sample_ids: Vec<String>,
+    is_liked: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let mut builder = QueryBuilder::new("UPDATE samples SET is_liked = ");
     builder.push_bind(is_liked);
     builder.push(" WHERE id IN (");
     let mut sep = builder.separated(", ");
-    for id in sample_ids { sep.push_bind(id); }
+    for id in sample_ids {
+        sep.push_bind(id);
+    }
     builder.push(")");
-    builder.build().execute(&state.db).await.map_err(|e| e.to_string())?;
+    builder
+        .build()
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -482,16 +597,21 @@ pub struct UpdateMetadataPayload {
 }
 
 #[tauri::command]
-pub async fn update_sample_metadata(payload: UpdateMetadataPayload, state: State<'_, AppState>) -> Result<(), String> {
-    sqlx::query("UPDATE samples SET filename = ?, bpm = ?, key_signature = ?, tags = ? WHERE id = ?")
-        .bind(payload.filename)
-        .bind(payload.bpm)
-        .bind(payload.key_signature)
-        .bind(payload.tags)
-        .bind(payload.id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn update_sample_metadata(
+    payload: UpdateMetadataPayload,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE samples SET filename = ?, bpm = ?, key_signature = ?, tags = ? WHERE id = ?",
+    )
+    .bind(payload.filename)
+    .bind(payload.bpm)
+    .bind(payload.key_signature)
+    .bind(payload.tags)
+    .bind(payload.id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -506,13 +626,23 @@ pub struct TagRecord {
 #[tauri::command]
 pub async fn get_user_tags(state: State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
     sqlx::query_as::<_, TagRecord>("SELECT category, value FROM user_tags ORDER BY value ASC")
-        .fetch_all(&state.db).await.map_err(|e| e.to_string())
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn create_user_tag(category: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn create_user_tag(
+    category: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     sqlx::query("INSERT OR IGNORE INTO user_tags (category, value) VALUES (?, ?)")
-        .bind(category).bind(value).execute(&state.db).await.map_err(|e| e.to_string())?;
+        .bind(category)
+        .bind(value)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -520,7 +650,10 @@ pub async fn create_user_tag(category: String, value: String, state: State<'_, A
 pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Result<(), String> {
     // 1. Den Tag global aus der user_tags Tabelle entfernen
     sqlx::query("DELETE FROM user_tags WHERE value = ?")
-        .bind(&value).execute(&state.db).await.map_err(|e| e.to_string())?;
+        .bind(&value)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Wir brauchen ein temporäres Struct, um die betroffenen Samples zu laden
     #[derive(sqlx::FromRow)]
@@ -531,9 +664,12 @@ pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Resul
 
     // 2. Suche alle Samples, die diesen Tag aktuell verwenden
     let pattern = format!("%\"value\":\"{}\"%", value);
-    let samples = sqlx::query_as::<_, SampleTagRow>("SELECT id, tags FROM samples WHERE tags LIKE ?")
-        .bind(pattern)
-        .fetch_all(&state.db).await.map_err(|e| e.to_string())?;
+    let samples =
+        sqlx::query_as::<_, SampleTagRow>("SELECT id, tags FROM samples WHERE tags LIKE ?")
+            .bind(pattern)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
 
     // 3. Cascade Delete: Den Tag aus der JSON jedes Samples entfernen.
     //    ENTERPRISE FIX: Alle UPDATEs in einer einzigen Transaktion — statt N
@@ -543,18 +679,17 @@ pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Resul
 
     for sample in samples {
         if let Ok(mut parsed_tags) = serde_json::from_str::<Vec<serde_json::Value>>(&sample.tags) {
-
             // Filtere das Array: Behalte alles, ABER NICHT den gelöschten Tag
-            parsed_tags.retain(|t| {
-                t.get("value").and_then(|v| v.as_str()) != Some(&value)
-            });
+            parsed_tags.retain(|t| t.get("value").and_then(|v| v.as_str()) != Some(&value));
 
             // Schreibe die gesäuberte JSON in die laufende Transaktion
             if let Ok(new_tags_string) = serde_json::to_string(&parsed_tags) {
                 sqlx::query("UPDATE samples SET tags = ? WHERE id = ?")
                     .bind(new_tags_string)
                     .bind(sample.id)
-                    .execute(&mut *tx).await.ok();
+                    .execute(&mut *tx)
+                    .await
+                    .ok();
             }
         }
     }
@@ -571,7 +706,10 @@ pub async fn delete_user_tag(value: String, state: State<'_, AppState>) -> Resul
 /// pays the BLOB I/O cost when the frontend actually needs to render a waveform
 /// (e.g. on hover or selection).
 #[tauri::command]
-pub async fn get_waveform(id: String, state: State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {
+pub async fn get_waveform(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<Vec<u8>>, String> {
     let row: Option<(Option<Vec<u8>>,)> =
         sqlx::query_as("SELECT waveform_data FROM samples WHERE id = ?")
             .bind(id)
@@ -593,7 +731,10 @@ pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<Ta
     let taxonomy = TaxonomyEngine::global();
     for rule in &taxonomy.rules {
         // Vermeide Duplikate im UI (z.B. weil "hat" und "hihat" beide zum Tag "Hi-Hat" führen)
-        if !all_tags.iter().any(|t: &TagRecord| t.value == rule.value && t.category == rule.category) {
+        if !all_tags
+            .iter()
+            .any(|t: &TagRecord| t.value == rule.value && t.category == rule.category)
+        {
             all_tags.push(TagRecord {
                 category: rule.category.to_string(),
                 value: rule.value.to_string(),
@@ -602,10 +743,11 @@ pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<Ta
     }
 
     // 2. Hole die flexiblen User-Tags aus der Datenbank
-    let user_tags = sqlx::query_as::<_, TagRecord>("SELECT category, value FROM user_tags ORDER BY value ASC")
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+    let user_tags =
+        sqlx::query_as::<_, TagRecord>("SELECT category, value FROM user_tags ORDER BY value ASC")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
 
     // 3. Füge beide Listen zusammen
     all_tags.extend(user_tags);
@@ -619,8 +761,8 @@ pub async fn get_all_available_tags(state: State<'_, AppState>) -> Result<Vec<Ta
 
 pub struct AudioState {
     pub stream_handle: rodio::OutputStreamHandle,
-    pub current_sink:  Mutex<Option<Arc<Sink>>>,
-    pub playback_id:   Arc<AtomicUsize>,
+    pub current_sink: Mutex<Option<Arc<Sink>>>,
+    pub playback_id: Arc<AtomicUsize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -654,20 +796,24 @@ const SINK_BUFFER_MAX: usize = 8;
 /// pitch so that it stays at `semitones` regardless of the speed change.
 #[inline(always)]
 fn flush_chunk(
-    interleaved_in:  &[f32],
-    frames:          usize,
-    channels:        usize,
-    sample_rate:     u32,
-    stretch:         &mut Option<ssstretch::Stretch>,
-    stretch_ratio:   f32,
-    in_deint:        &mut Vec<Vec<f32>>,
-    out_deint:       &mut Vec<Vec<f32>>,
-    sink:            &Arc<Sink>,
+    interleaved_in: &[f32],
+    frames: usize,
+    channels: usize,
+    sample_rate: u32,
+    stretch: &mut Option<ssstretch::Stretch>,
+    stretch_ratio: f32,
+    in_deint: &mut Vec<Vec<f32>>,
+    out_deint: &mut Vec<Vec<f32>>,
+    sink: &Arc<Sink>,
 ) {
     if let Some(ref mut s) = stretch {
         // ── Pitch-shift / time-stretch path ───────────────────────────────
         // Deinterleave: [L,R, L,R, …] → [[L,L,…], [R,R,…]]
-        for (fi, frame) in interleaved_in.chunks_exact(channels).take(frames).enumerate() {
+        for (fi, frame) in interleaved_in
+            .chunks_exact(channels)
+            .take(frames)
+            .enumerate()
+        {
             for (ch, &sample) in frame.iter().enumerate() {
                 in_deint[ch][fi] = sample;
             }
@@ -713,17 +859,17 @@ fn flush_chunk(
 /// 3. Optionally applies ssstretch pitch-shifting and/or time-stretching — skipped entirely when not needed
 /// 4. Cancels cleanly when `playback_id` no longer matches `expected_id`
 fn spawn_playback_thread(
-    file_path:     String,
-    semitones:     f32,
-    stretch_ratio: f32,   // 1.0 = no tempo change; target_bpm / sample_bpm otherwise
-    sink:          Arc<Sink>,
-    playback_id:   Arc<AtomicUsize>,
-    expected_id:   usize,
+    file_path: String,
+    semitones: f32,
+    stretch_ratio: f32, // 1.0 = no tempo change; target_bpm / sample_bpm otherwise
+    sink: Arc<Sink>,
+    playback_id: Arc<AtomicUsize>,
+    expected_id: usize,
 ) {
     std::thread::spawn(move || {
         // ── 1. Open & probe (format-agnostic) ─────────────────────────────
         let file = match std::fs::File::open(&file_path) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => {
                 tracing::error!("play_audio: cannot open '{}': {}", file_path, e);
                 return;
@@ -746,7 +892,7 @@ fn spawn_playback_thread(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         ) {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(e) => {
                 tracing::error!("play_audio: probe failed for '{}': {}", file_path, e);
                 return;
@@ -757,22 +903,20 @@ fn spawn_playback_thread(
 
         let track = match format.default_track() {
             Some(t) => t,
-            None    => {
+            None => {
                 tracing::error!("play_audio: no audio track in '{}'", file_path);
                 return;
             }
         };
 
         let sample_rate: u32 = track.codec_params.sample_rate.unwrap_or(44100);
-        let channels:    usize = track.codec_params.channels
-            .map(|c| c.count())
-            .unwrap_or(2);
+        let channels: usize = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
         let track_id = track.id;
 
         let mut decoder = match symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
         {
-            Ok(d)  => d,
+            Ok(d) => d,
             Err(e) => {
                 tracing::error!("play_audio: decoder error for '{}': {}", file_path, e);
                 return;
@@ -787,7 +931,11 @@ fn spawn_playback_thread(
             s.preset_default(channels as i32, sample_rate as f32);
             // Pass stretch_ratio as the playback speed when BPM stretching is active.
             // ssstretch handles combined pitch + tempo in a single phase-vocoder pass.
-            let speed = if (stretch_ratio - 1.0).abs() > 0.01 { Some(stretch_ratio) } else { None };
+            let speed = if (stretch_ratio - 1.0).abs() > 0.01 {
+                Some(stretch_ratio)
+            } else {
+                None
+            };
             s.set_transpose_semitones(semitones, speed);
             Some(s)
         } else {
@@ -796,7 +944,7 @@ fn spawn_playback_thread(
 
         // ── 3. Pre-allocate ALL mutable buffers outside the hot loop ───────
         // This eliminates repeated heap allocations inside the decode loop.
-        let mut in_deint:  Vec<Vec<f32>> = vec![vec![0.0; CHUNK_FRAMES]; channels];
+        let mut in_deint: Vec<Vec<f32>> = vec![vec![0.0; CHUNK_FRAMES]; channels];
         let mut out_deint: Vec<Vec<f32>> = vec![vec![0.0; CHUNK_FRAMES]; channels];
 
         // Ring buffer for decoded interleaved samples awaiting processing.
@@ -807,7 +955,11 @@ fn spawn_playback_thread(
 
         tracing::debug!(
             "play_audio: starting stream '{}' | {}ch | {}Hz | pitch {:+.2} st | speed {:.3}x",
-            file_path, channels, sample_rate, semitones, stretch_ratio
+            file_path,
+            channels,
+            sample_rate,
+            semitones,
+            stretch_ratio
         );
 
         // ── 4. Streaming decode + playback loop ────────────────────────────
@@ -843,7 +995,7 @@ fn spawn_playback_thread(
 
             // Decode the next Symphonia packet
             let packet = match format.next_packet() {
-                Ok(p)  => p,
+                Ok(p) => p,
                 Err(_) => {
                     // EOF — flush any remaining samples
                     let frames_left = pending.len() / channels;
@@ -870,7 +1022,7 @@ fn spawn_playback_thread(
             }
 
             let audio_buf = match decoder.decode(&packet) {
-                Ok(b)  => b,
+                Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("play_audio: skipping corrupt packet: {}", e);
                     continue;
@@ -894,18 +1046,17 @@ fn spawn_playback_thread(
 
 #[tauri::command]
 pub fn play_audio(
-    file_path:     String,
-    semitones:     f32,
-    stretch_ratio: f32,   // 1.0 = no BPM stretch; target_bpm / sample_bpm otherwise
-    volume:        f32,
-    state:         State<'_, AudioState>,
+    file_path: String,
+    semitones: f32,
+    stretch_ratio: f32, // 1.0 = no BPM stretch; target_bpm / sample_bpm otherwise
+    volume: f32,
+    speed: Option<f32>,
+    state: State<'_, AudioState>,
 ) -> Result<(), String> {
     // Atomically increment playback ID — this cancels any running thread
     let new_id = state.playback_id.fetch_add(1, Ordering::SeqCst) + 1;
 
-    let sink = Arc::new(
-        Sink::try_new(&state.stream_handle).map_err(|e| e.to_string())?
-    );
+    let sink = Arc::new(Sink::try_new(&state.stream_handle).map_err(|e| e.to_string())?);
     sink.set_volume(volume);
 
     // Swap in the new sink, stopping the previous one cleanly
@@ -916,6 +1067,9 @@ pub fn play_audio(
         }
         *guard = Some(Arc::clone(&sink));
     }
+
+    let playback_speed = speed.unwrap_or(1.0);
+    sink.set_speed(playback_speed);
 
     spawn_playback_thread(
         file_path,
@@ -946,8 +1100,112 @@ pub fn set_audio_volume(volume: f32, state: State<'_, AudioState>) {
     }
 }
 
-use hound::{WavReader, WavWriter, SampleFormat};
+use hound::{SampleFormat, WavReader, WavWriter};
 use uuid::Uuid;
+
+// ENTERPRISE ZERO-CROSSING ALGORITHM
+// Sucht in einem 20ms Fenster (+/- 10ms) nach dem perfekten Nulldurchgang.
+// Wandelt Stereo-Signale dafuer temporaer in einen perfekten Mono-Mix um.
+fn find_zero_crossing(
+    path: &str,
+    target_frame: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<u32, String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    let total_frames = reader.duration();
+
+    // Suchfenster: 10ms in jede Richtung um den anvisierten Schnittpunkt
+    let window_frames = (0.010 * sample_rate as f64) as u32;
+    let start_f = target_frame.saturating_sub(window_frames);
+    let end_f = std::cmp::min(total_frames, target_frame + window_frames);
+    let frames_to_read = end_f - start_f;
+
+    if frames_to_read == 0 {
+        return Ok(target_frame);
+    }
+
+    reader
+        .seek(start_f * channels as u32)
+        .map_err(|e| e.to_string())?;
+
+    // Lokalen Puffer für die Such-Mathematik aufbauen (Mono-Mix)
+    let mut mono_mix = Vec::with_capacity(frames_to_read as usize);
+    let ch = channels as u32;
+
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            if spec.bits_per_sample <= 16 {
+                let mut iter = reader.samples::<i16>();
+                for _ in 0..frames_to_read {
+                    let mut sum = 0.0;
+                    for _ in 0..ch {
+                        if let Some(Ok(s)) = iter.next() {
+                            sum += s as f32;
+                        }
+                    }
+                    mono_mix.push(sum);
+                }
+            } else {
+                let mut iter = reader.samples::<i32>();
+                for _ in 0..frames_to_read {
+                    let mut sum = 0.0;
+                    for _ in 0..ch {
+                        if let Some(Ok(s)) = iter.next() {
+                            sum += s as f32;
+                        }
+                    }
+                    mono_mix.push(sum);
+                }
+            }
+        }
+        hound::SampleFormat::Float => {
+            let mut iter = reader.samples::<f32>();
+            for _ in 0..frames_to_read {
+                let mut sum = 0.0;
+                for _ in 0..ch {
+                    if let Some(Ok(s)) = iter.next() {
+                        sum += s;
+                    }
+                }
+                mono_mix.push(sum);
+            }
+        }
+    }
+
+    let target_idx = (target_frame - start_f) as usize;
+    let mut best_frame = target_frame;
+    let mut min_distance = usize::MAX;
+
+    // 1. Prioritaet: Positiver Nulldurchgang (Verhindert Phasenprobleme beim Looping)
+    for i in 0..(mono_mix.len().saturating_sub(1)) {
+        if mono_mix[i] <= 0.0 && mono_mix[i + 1] >= 0.0 {
+            let dist = (i as isize - target_idx as isize).abs() as usize;
+            if dist < min_distance {
+                min_distance = dist;
+                best_frame = start_f + i as u32;
+            }
+        }
+    }
+
+    // 2. Fallback: Irgendein Nulldurchgang (falls keine saubere Steigung gefunden wurde)
+    if min_distance == usize::MAX {
+        for i in 0..(mono_mix.len().saturating_sub(1)) {
+            if (mono_mix[i] <= 0.0 && mono_mix[i + 1] >= 0.0)
+                || (mono_mix[i] >= 0.0 && mono_mix[i + 1] <= 0.0)
+            {
+                let dist = (i as isize - target_idx as isize).abs() as usize;
+                if dist < min_distance {
+                    min_distance = dist;
+                    best_frame = start_f + i as u32;
+                }
+            }
+        }
+    }
+
+    Ok(best_frame)
+}
 
 #[tauri::command]
 pub async fn slice_audio(path: String, start_ms: f64, end_ms: f64) -> Result<String, String> {
@@ -955,46 +1213,74 @@ pub async fn slice_audio(path: String, start_ms: f64, end_ms: f64) -> Result<Str
         return Ok(path);
     }
 
-    let mut reader = WavReader::open(&path).map_err(|e| format!("Failed to open WAV: {}", e))?;
-    let spec = reader.spec();
+    // Vorab Metadaten laden, um das Zero-Crossing unabhaengig vom Schreib-Stream auszufuehren
+    let spec;
+    let total_frames;
+    {
+        let reader =
+            hound::WavReader::open(&path).map_err(|e| format!("Failed to open WAV: {}", e))?;
+        spec = reader.spec();
+        total_frames = reader.duration();
+    }
+
     let sample_rate = spec.sample_rate as f64;
     let channels = spec.channels as u32;
 
-    let start_sample = ((start_ms / 1000.0) * sample_rate) as u32;
-    let end_sample = ((end_ms / 1000.0) * sample_rate) as u32;
+    let mut start_frame = ((start_ms / 1000.0) * sample_rate) as u32;
+    let mut end_frame = ((end_ms / 1000.0) * sample_rate) as u32;
 
+    start_frame = std::cmp::min(start_frame, total_frames);
+    end_frame = std::cmp::min(end_frame, total_frames);
+
+    // ENTERPRISE PHASE 3: Zero-Crossing Anpassung vor dem endgueltigen Schnitt!
+    start_frame = find_zero_crossing(&path, start_frame, spec.sample_rate, spec.channels)?;
+    end_frame = find_zero_crossing(&path, end_frame, spec.sample_rate, spec.channels)?;
+
+    if start_frame > end_frame {
+        std::mem::swap(&mut start_frame, &mut end_frame);
+    }
+
+    // Der eigentliche O(1) Schnitt mit den neuen, perfekten Koordinaten
+    let mut reader =
+        hound::WavReader::open(&path).map_err(|e| format!("Failed to open WAV: {}", e))?;
     let temp_dir = std::env::temp_dir();
-    let out_path = temp_dir.join(format!("samplevault_slice_{}.wav", Uuid::new_v4()));
+    let out_path = temp_dir.join(format!("samplevault_slice_{}.wav", uuid::Uuid::new_v4()));
 
-    let mut writer = WavWriter::create(&out_path, spec).map_err(|e| e.to_string())?;
+    let mut writer = hound::WavWriter::create(&out_path, spec).map_err(|e| e.to_string())?;
 
-    // ENTERPRISE FIX: O(1) Seek! Überspringt Millionen von Samples in absoluter Nullzeit.
-    reader.seek(start_sample).map_err(|e| format!("Seek error: {}", e))?;
+    reader
+        .seek(start_frame * channels)
+        .map_err(|e| format!("Seek error: {}", e))?;
 
-    let duration_samples = end_sample.saturating_sub(start_sample);
-    let total_samples_to_read = duration_samples * channels;
+    let duration_frames = end_frame.saturating_sub(start_frame);
+    let total_samples_to_read = duration_frames * channels;
     let mut samples_read = 0;
 
-    // Hochperformantes Herauskopieren exakt der markierten Daten (Int oder Float)
     match spec.sample_format {
-        SampleFormat::Int => {
+        hound::SampleFormat::Int => {
             if spec.bits_per_sample <= 16 {
                 for s in reader.samples::<i16>() {
-                    if samples_read >= total_samples_to_read { break; }
+                    if samples_read >= total_samples_to_read {
+                        break;
+                    }
                     writer.write_sample(s.unwrap_or(0)).ok();
                     samples_read += 1;
                 }
             } else {
                 for s in reader.samples::<i32>() {
-                    if samples_read >= total_samples_to_read { break; }
+                    if samples_read >= total_samples_to_read {
+                        break;
+                    }
                     writer.write_sample(s.unwrap_or(0)).ok();
                     samples_read += 1;
                 }
             }
-        },
-        SampleFormat::Float => {
+        }
+        hound::SampleFormat::Float => {
             for s in reader.samples::<f32>() {
-                if samples_read >= total_samples_to_read { break; }
+                if samples_read >= total_samples_to_read {
+                    break;
+                }
                 writer.write_sample(s.unwrap_or(0.0)).ok();
                 samples_read += 1;
             }

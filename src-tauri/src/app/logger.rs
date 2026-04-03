@@ -1,10 +1,13 @@
 use tauri::{App, Manager};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn setup_logging(app: &App) -> WorkerGuard {
     // Ermittelt den standardisierten Log-Ordner des Betriebssystems (macOS: ~/Library/Logs/...)
-    let log_dir = app.path().app_log_dir().expect("Failed to determine log directory");
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .expect("Failed to determine log directory");
     std::fs::create_dir_all(&log_dir).expect("Failed to create log directory");
 
     // Täglich rotierende Log-Dateien (verhindert gigantische Dateien)
@@ -26,8 +29,8 @@ pub fn setup_logging(app: &App) -> WorkerGuard {
         .with_target(false);
 
     // Filter: Blockiert den Datenbank-Spam von sqlx, lässt aber unsere eigenen Logs durch
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
 
     tracing_subscriber::registry()
         .with(filter)

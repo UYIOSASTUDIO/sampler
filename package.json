@@ -50,6 +50,7 @@
 		"@crabnebula/tauri-plugin-drag": "^2.1.0",
 		"@tauri-apps/plugin-dialog": "^2.6.0",
 		"@tauri-apps/plugin-fs": "^2.4.5",
+		"@tauri-apps/plugin-window-state": "^2.4.1",
 		"lucide-svelte": "^1.0.1"
 	}
 }

@@ -25,6 +25,10 @@ export const appState = $state({
     selectedSampleIds: [] as string[], // Hält alle Checkbox-IDs
     collections: [] as {id: number, name: string}[], // Hält die Ordner-Liste
 
+    vinylSpeedMode: 1.0,
+    sidebarWidth: 256,
+    autoPlayEnabled: true,
+
     currentSample: null as any,
     isPlaying: false,
     playbackProgress: 0,

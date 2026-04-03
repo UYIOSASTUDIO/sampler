@@ -28,7 +28,7 @@ const MAX_WAVEFORM_SAMPLES: usize = 44_100 * 2 * 60;
 /// A `Vec<u8>` of length `num_bars`, each value in `[2, 100]`.
 pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let mss  = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -36,12 +36,17 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String>
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| e.to_string())?;
 
-    let mut format  = probed.format;
-    let track       = format.default_track().ok_or("No default audio track")?;
-    let track_id    = track.id;
+    let mut format = probed.format;
+    let track = format.default_track().ok_or("No default audio track")?;
+    let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -53,7 +58,7 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String>
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => break, // EOF or unrecoverable error
         };
 
@@ -62,14 +67,13 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String>
         }
 
         let audio_buf = match decoder.decode(&packet) {
-            Ok(b)  => b,
+            Ok(b) => b,
             Err(_) => break,
         };
 
         let spec = *audio_buf.spec();
-        let sb = sample_buf.get_or_insert_with(|| {
-            SampleBuffer::new(audio_buf.capacity() as u64, spec)
-        });
+        let sb =
+            sample_buf.get_or_insert_with(|| SampleBuffer::new(audio_buf.capacity() as u64, spec));
         sb.copy_interleaved_ref(audio_buf);
         all_samples.extend_from_slice(sb.samples());
 
@@ -89,7 +93,7 @@ pub fn extract_waveform(path: &Path, num_bars: usize) -> Result<Vec<u8>, String>
 
     for i in 0..num_bars {
         let start = i * chunk_size;
-        let end   = (start + chunk_size).min(all_samples.len());
+        let end = (start + chunk_size).min(all_samples.len());
         let chunk = &all_samples[start..end];
 
         // Branchless peak: fold over absolute values

@@ -1,6 +1,6 @@
 <script lang="ts">
     import '../app.css';
-    import { onMount } from 'svelte';
+    import {onDestroy, onMount} from 'svelte';
     import { appState } from '$lib/store.svelte';
     import { getCurrentWindow } from '@tauri-apps/api/window'; // NEU: Direkte Tauri Window API
     import { invoke, convertFileSrc } from '@tauri-apps/api/core';
@@ -9,6 +9,8 @@
         SkipBack, SkipForward, Volume2, Sun, Moon, Library, Settings,
         Music, Type, Image as ImageIcon, FolderOpen
     } from 'lucide-svelte';
+
+    import { FastForward, Rewind } from 'lucide-svelte';
 
     let { children } = $props();
 
@@ -60,6 +62,41 @@
         };
     }
 
+    // --- ENTERPRISE RESIZABLE SIDEBAR ---
+    let isResizingSidebar = $state(false);
+
+    function startSidebarResize(e: MouseEvent) {
+        isResizingSidebar = true;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        window.addEventListener('mousemove', handleSidebarResize);
+        window.addEventListener('mouseup', stopSidebarResize);
+    }
+
+    function handleSidebarResize(e: MouseEvent) {
+        if (!isResizingSidebar) return;
+        let newWidth = e.clientX;
+        if (newWidth < 200) newWidth = 200; // Minimalbreite
+        if (newWidth > 600) newWidth = 600; // Maximalbreite
+        appState.sidebarWidth = newWidth;
+    }
+
+    function stopSidebarResize() {
+        isResizingSidebar = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        window.removeEventListener('mousemove', handleSidebarResize);
+        window.removeEventListener('mouseup', stopSidebarResize);
+        localStorage.setItem('samplevault-sidebar-width', appState.sidebarWidth.toString());
+    }
+
+    // Speichert die Auto-Play Einstellung sofort ab, wenn sie im Settings-Menü geändert wird
+    $effect(() => {
+        if (typeof window !== 'undefined' && appState.autoPlayEnabled !== undefined) {
+            localStorage.setItem('samplevault-autoplay', appState.autoPlayEnabled.toString());
+        }
+    });
+
     onMount(async() => {
         const savedTheme = localStorage.getItem('samplevault-theme') as 'light' | 'dark' | 'system' | null;
         if (savedTheme) {
@@ -76,6 +113,21 @@
             }
         }
 
+        // Lade Sidebar-Breite
+        const savedWidth = localStorage.getItem('samplevault-sidebar-width');
+        if (savedWidth) {
+            const w = parseInt(savedWidth, 10);
+            if (!isNaN(w)) appState.sidebarWidth = w;
+        }
+
+        // Lade Auto-Play
+        const savedAutoPlay = localStorage.getItem('samplevault-autoplay');
+        if (savedAutoPlay !== null) {
+            appState.autoPlayEnabled = savedAutoPlay === 'true';
+        }
+
+        window.addEventListener('click', handleVinylOutsideClick);
+
         systemMedia = window.matchMedia('(prefers-color-scheme: dark)');
         systemMedia.addEventListener('change', applyTheme);
 
@@ -86,6 +138,10 @@
 
         applyTheme();
         await loadCollections();
+    });
+
+    onDestroy(async() => {
+        window.removeEventListener('click', handleVinylOutsideClick);
     });
 
     async function loadCollections() {
@@ -177,6 +233,26 @@
         appState.filters.onlyLiked = false;
         if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('trigger-sample-reload'));
     }
+
+    let isVinylDropdownOpen = $state(false);
+
+    function setVinylMode(speed: number) {
+        appState.vinylSpeedMode = speed;
+        isVinylDropdownOpen = false;
+
+        // Kommuniziert über die Dateigrenze hinweg mit der +page.svelte und erzwingt einen Live-Neustart!
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('force-retrigger'));
+        }
+    }
+
+    // Schließt das Menü, wenn man woanders hinklickt
+    const handleVinylOutsideClick = (e: MouseEvent) => {
+        const target = e.target as HTMLElement;
+        if (!target.closest('.vinyl-dropdown-container')) {
+            isVinylDropdownOpen = false;
+        }
+    };
 </script>
 
 <svelte:window bind:innerWidth={windowWidth} />
@@ -185,7 +261,7 @@
 
     <div class="flex flex-1 overflow-hidden pb-16">
 
-        <aside class="flex w-64 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800/60 dark:bg-[#18181b]">
+        <aside class="relative flex flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800/60 dark:bg-[#18181b] shrink-0" style="width: {appState.sidebarWidth}px">
 
             <div use:dragRegion class="flex h-14 items-center pl-25 pr-6 border-b border-zinc-200 dark:border-zinc-800/60 shrink-0 select-none">
                 <span class="font-bold tracking-tight text-lg">SampleVault</span>
@@ -199,10 +275,6 @@
                                 class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {!appState.filters.onlyLiked && appState.filters.collectionId === null ? 'bg-zinc-200/50 dark:bg-zinc-800/50 text-zinc-900 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}"
                         >
                             <Library size={18} /> Sounds
-                        </button>
-
-                        <button class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100 transition-colors cursor-pointer">
-                            <Compass size={18} /> Discover
                         </button>
                     </div>
 
@@ -243,18 +315,21 @@
                 {:else if appState.currentView === 'settings'}
                     <div class="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Preferences</div>
                     <div class="space-y-1">
-                        <button onclick={() => appState.activeSettingsTab = 'general'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'general' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
-                            General
-                        </button>
-                        <button onclick={() => appState.activeSettingsTab = 'library'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'library' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
-                            Library
-                        </button>
-                        <button onclick={() => appState.activeSettingsTab = 'audio'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'audio' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">
-                            Audio
-                        </button>
+                        <button onclick={() => appState.activeSettingsTab = 'general'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'general' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">General</button>
+                        <button onclick={() => appState.activeSettingsTab = 'library'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'library' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">Library</button>
+                        <button onclick={() => appState.activeSettingsTab = 'audio'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'audio' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">Audio</button>
+
+                        <button onclick={() => appState.activeSettingsTab = 'tags'} class="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer {appState.activeSettingsTab === 'tags' ? 'bg-zinc-200/50 text-zinc-900 dark:bg-zinc-800/50 dark:text-zinc-50' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/30 dark:hover:text-zinc-100'}">Tags</button>
                     </div>
                 {/if}
             </nav>
+
+            <div
+                    class="absolute top-0 bottom-0 -right-[5px] w-[10px] cursor-col-resize z-50 flex justify-center group"
+                    onmousedown={startSidebarResize}
+            >
+                <div class="w-px h-full bg-emerald-500 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+            </div>
         </aside>
 
         <div class="flex flex-1 flex-col relative min-w-0">
@@ -339,9 +414,11 @@
                     <div class="h-6 w-px bg-zinc-200 dark:bg-zinc-700"></div>
 
                     <div class="flex items-center gap-3 px-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-                        <span class="w-8 text-center">{appState.currentSample.key_signature || '--'}</span>
-                        <span class="w-12 text-center">{appState.currentSample.bpm ? Math.round(appState.currentSample.bpm) : '--'} BPM</span>
+                        <span class="w-14 text-center whitespace-nowrap">{appState.currentSample.key_signature || '--'}</span>
+                        <span class="w-16 text-center whitespace-nowrap">{appState.currentSample.bpm ? Math.round(appState.currentSample.bpm) : '--'} BPM</span>
                     </div>
+
+                    <div class="h-6 w-px bg-zinc-200 dark:bg-zinc-700"></div>
 
                     <div class="h-6 w-px bg-zinc-200 dark:bg-zinc-700"></div>
 
@@ -354,7 +431,66 @@
             {/if}
         </div>
 
-        <div class="flex items-center justify-end gap-3 w-1/4 text-zinc-500 dark:text-zinc-400">
+        <div class="flex items-center justify-end gap-4 w-[30%] text-zinc-500 dark:text-zinc-400 pr-2">
+            <div class="relative shrink-0 vinyl-dropdown-container">
+                <button
+                        onclick={(e) => { e.stopPropagation(); isVinylDropdownOpen = !isVinylDropdownOpen; }}
+                        class="flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer shadow-sm
+                        {appState.vinylSpeedMode > 1.0
+                            ? 'border-orange-500 bg-orange-500 text-white shadow-orange-500/30'
+                            : appState.vinylSpeedMode < 1.0
+                                ? 'border-purple-500 bg-purple-500 text-white shadow-purple-500/30'
+                                : 'border-zinc-200 bg-zinc-100 text-zinc-500 hover:bg-zinc-200 dark:border-zinc-700/50 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'}"
+                        title="Vinyl Speed Mode"
+                >
+                    {#if appState.vinylSpeedMode === 2.0}
+                        <FastForward size={12} class="shrink-0" />
+                        <span>Kanye 2x</span>
+                    {:else if appState.vinylSpeedMode === 1.5}
+                        <FastForward size={12} class="shrink-0" />
+                        <span>Fast 1.5x</span>
+                    {:else if appState.vinylSpeedMode === 0.5}
+                        <Rewind size={12} class="shrink-0" />
+                        <span>Screwed 0.5x</span>
+                    {:else}
+                        <span class="flex h-2.5 w-2.5 items-center justify-center rounded-full border-[1.5px] border-zinc-400"></span>
+                        <span>Vinyl 1x</span>
+                    {/if}
+                </button>
+
+                {#if isVinylDropdownOpen}
+                    <div class="absolute bottom-full right-0 mb-2 w-40 flex-col rounded-xl border border-zinc-200 bg-white p-1.5 shadow-2xl dark:border-zinc-700/60 dark:bg-[#18181b] z-50 flex animate-in fade-in slide-in-from-bottom-2 duration-200">
+
+                        <button onclick={() => setVinylMode(2.0)} class="flex items-center justify-between rounded-md px-3 py-2 text-xs font-bold {appState.vinylSpeedMode === 2.0 ? 'bg-orange-50 text-orange-600 dark:bg-orange-900/20 dark:text-orange-400' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'} transition-colors cursor-pointer">
+                            <span class="flex items-center gap-2"><FastForward size={14} /> Kanye</span>
+                            <span class="text-[10px] opacity-70">2.0x</span>
+                        </button>
+
+                        <button onclick={() => setVinylMode(1.5)} class="flex items-center justify-between rounded-md px-3 py-2 text-xs font-bold {appState.vinylSpeedMode === 1.5 ? 'bg-orange-50 text-orange-600 dark:bg-orange-900/20 dark:text-orange-400' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'} transition-colors cursor-pointer">
+                            <span class="flex items-center gap-2"><FastForward size={14} /> Fast</span>
+                            <span class="text-[10px] opacity-70">1.5x</span>
+                        </button>
+
+                        <div class="my-1 border-t border-zinc-100 dark:border-zinc-800/50"></div>
+
+                        <button onclick={() => setVinylMode(1.0)} class="flex items-center justify-between rounded-md px-3 py-2 text-xs font-bold {appState.vinylSpeedMode === 1.0 ? 'bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-white' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'} transition-colors cursor-pointer">
+                            <span class="flex items-center gap-2"><span class="flex h-3 w-3 items-center justify-center rounded-full border-[1.5px] border-current"></span> Normal</span>
+                            <span class="text-[10px] opacity-70">1.0x</span>
+                        </button>
+
+                        <div class="my-1 border-t border-zinc-100 dark:border-zinc-800/50"></div>
+
+                        <button onclick={() => setVinylMode(0.5)} class="flex items-center justify-between rounded-md px-3 py-2 text-xs font-bold {appState.vinylSpeedMode === 0.5 ? 'bg-purple-50 text-purple-600 dark:bg-purple-900/20 dark:text-purple-400' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'} transition-colors cursor-pointer">
+                            <span class="flex items-center gap-2"><Rewind size={14} /> Screwed</span>
+                            <span class="text-[10px] opacity-70">0.5x</span>
+                        </button>
+
+                    </div>
+                {/if}
+            </div>
+
+            <div class="h-4 w-px bg-zinc-200 dark:bg-zinc-700"></div>
+
             <Volume2 size={18} />
             <input
                     type="range" min="0" max="1" step="0.01"

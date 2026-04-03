@@ -5,17 +5,18 @@ mod audio;
 mod db;
 mod vault;
 
-use app::state::AppState;
 use app::commands;
-use std::fs;
-use tauri::{Manager, PhysicalSize};
+use app::state::AppState;
 use rodio::OutputStream;
-use std::sync::{Arc, Mutex};
+use std::fs;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
+use tauri::{Manager, PhysicalSize};
 
 fn main() {
     // 1. Initialisiere die native Audio-Engine des Betriebssystems
-    let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to initialize audio stream");
+    let (_stream, stream_handle) =
+        OutputStream::try_default().expect("Failed to initialize audio stream");
 
     // 2. Enterprise-Hack: Den Stream im RAM "leaken", damit er während der gesamten App-Laufzeit offen bleibt
     std::mem::forget(_stream);
@@ -28,6 +29,8 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(audio_state)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

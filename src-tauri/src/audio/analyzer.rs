@@ -30,19 +30,22 @@ pub fn extract_metadata(path: &Path) -> Result<AudioMetadata, String> {
 
     let format = probed.format;
 
-    let track = format.default_track().ok_or("No default audio track found")?;
+    let track = format
+        .default_track()
+        .ok_or("No default audio track found")?;
     let codec_params = &track.codec_params;
 
     let sample_rate = codec_params.sample_rate.unwrap_or(44100);
     let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2);
     let bit_depth = codec_params.bits_per_sample.unwrap_or(16) as u16;
 
-    let duration_ms = if let (Some(n_frames), Some(tb)) = (codec_params.n_frames, codec_params.time_base) {
-        let time = tb.calc_time(n_frames);
-        (time.seconds as i64 * 1000) + (time.frac as f64 * 1000.0) as i64
-    } else {
-        0
-    };
+    let duration_ms =
+        if let (Some(n_frames), Some(tb)) = (codec_params.n_frames, codec_params.time_base) {
+            let time = tb.calc_time(n_frames);
+            (time.seconds as i64 * 1000) + (time.frac as f64 * 1000.0) as i64
+        } else {
+            0
+        };
 
     Ok(AudioMetadata {
         duration_ms,
